@@ -1,469 +1,337 @@
-# PALIMPSEST
+# Sluice
 
-**Divergence-safe durable execution for agent decisioning.**
+**Divergence-safe durable execution for AI agents that act.**
 
-When an automated decisioning layer crashes mid-decision, it either loses the signal
-or duplicates it. Both are the exact failure the decisioning layer was built to
-eliminate. It is not an intelligence problem. It is an architecture problem.
+![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-HTTP%20services-009688?logo=fastapi&logoColor=white)
+![Redis](https://img.shields.io/badge/Redis-Streams-DC382D?logo=redis&logoColor=white)
+![SQLite](https://img.shields.io/badge/SQLite-WAL%20journal-003B57?logo=sqlite&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)
+![pytest](https://img.shields.io/badge/tests-351%20passing-2E7D32?logo=pytest&logoColor=white)
 
-A palimpsest is a manuscript where the erased writing still shows through. That is
-this journal: the path the system abandoned is still legible, which is what makes the
-cleanup provable and the audit trail real.
+When an automated decisioning layer crashes mid-decision, it either loses the signal or
+duplicates it. Durable-execution engines (Temporal, Restate, DBOS) recover by *replaying*
+journaled decisions, which assumes the decisions were right and deterministic. An AI agent's
+are neither. Sluice is a recovery engine for agents whose actions have side effects in
+the real world: it forks the journal at a bad decision, cleans up what the abandoned path
+already did, and only then takes the irreversible action.
 
-Two-page design summary: [`DESIGN.md`](DESIGN.md) — architecture, the seven design
-decisions and the scenario analysis. 
+> A sluice is a gate that holds the flow back until the channel behind it is drained, then
+> lifts. Here the gate stands in front of every irreversible action: nothing goes through
+> until the path the agent abandoned has been cleaned up, newest effect first. That path is
+> never erased, either: the journal is a tree, so it stays on record, which is what makes
+> the cleanup provable and the audit trail real.
+
+Built for the Signal Labs AI HackDay (Hyderabad), Distributed Systems track, as the
+reliability layer an automated-decisioning product like Signal Labs' SignalOS needs once it
+stops recommending and starts acting. The demo domain is incident triage: an agent reads an
+alert, classifies it, then opens a ticket, posts to a channel and pages the on-call.
+
+---
+
+## Contents
+
+- [The problem](#the-problem) · [How it works](#how-it-works) · [Architecture](#architecture)
+- [Features](#key-features) · [Tech stack](#tech-stack) · [Project structure](#project-structure)
+- [Quick start](#quick-start) · [Running it distributed](#running-it-as-a-distributed-system)
+- [Testing and verification](#testing-and-verification) · [Results](#results)
+- [Where it falls over](#where-it-falls-over) · [Documentation](#documentation)
 
 ---
 
 ## The problem
 
-An agent classifies an incident, acts on that classification, and the action fails
-because the classification was wrong. Recovery now has two bad options:
+An agent classifies an incident as **P2**, which routes to **rota-X**, and starts acting:
+dedupe marker, ticket, channel post, page. The page fails because rota-X has nobody on
+call. The right answer was P1, and rota-Y. Recovery now has two conventional options, and
+both are wrong:
 
-- **Replay the journaled decision.** It was wrong the first time, so it fails again,
-  forever. The signal is lost and nobody is paged.
-- **Re-run the agent from scratch.** It reaches a better answer, but the effects from
-  the first attempt are still standing: a duplicate ticket, a duplicate post, and a
-  second phone call that explains nothing.
+| Strategy | What happens | Outcome |
+|---|---|---|
+| **Pinned replay**: what durable execution guarantees | replays the journaled P2, which fails again, forever | 1 ticket · 1 post · **0 pages**. The signal is lost |
+| **Naive re-run**: start the agent over | reaches P1, but the first attempt's effects are still standing | **2 tickets · 2 posts** · 1 page. Duplicates, no cleanup |
+| **Sluice** | forks at the decision, compensates the abandoned branch, then pages | 1 ticket · 1 post · **1 page, to the right rota** |
 
-Durable execution frameworks guarantee the *first* behaviour. That guarantee is the
-bug when the thing being replayed is a judgement rather than a computation.
+## How it works
 
-PALIMPSEST takes a third path: fork the journal at the decision, prove the abandoned
-branch is cleaned up, and only then take the irreversible action.
+![Recovering the poison step](docs/images/recovery-protocol.drawio.svg)
 
----
+Three ideas carry the design:
+
+1. **The journal is a tree, not a log.** Recovery that wants a different path forks a
+   branch and marks the old one abandoned. The journal records what was tried, not just
+   what was done.
+2. **Tool calls are typed by effect.** `pure` / `idempotent` / `compensatable` /
+   `irreversible`, crossed with `observable` / `unobservable`. That makes recovery
+   decidable: probe what can be observed, undo what can be compensated, escalate what can
+   be neither.
+3. **The irreversible barrier.** A branch may not execute an irreversible effect while
+   *any* abandoned branch in the workflow holds uncompensated effects. Compensation runs in
+   reverse execution order (LIFO, as in sagas). The barrier is **bounded**: if cleanup
+   keeps failing it retries to a deadline, then escalates to a human with the branch tree
+   attached. It never hangs and never acts blind.
+
+Correctness is a checkable property, **Effect-Exactly-Once** (EEO). After crash, recovery
+and quiescence: (1) no irreversible effect commits twice per decision point, (2) every
+workflow ends in a committed action or a surfaced escalation, (3) every effect on an
+abandoned branch is compensated, in reverse order. Exactly-once is impossible for an
+irreversible *and* unobservable effect (the two generals problem), so that case is
+confined to one unknown at a time and always surfaced. EEO is graded against an
+out-of-process **ground-truth ledger**, never against what the system believed.
 
 ## Architecture
 
-![Architecture](signal-labs-hack-architecture.drawio.svg)
-
-Four OS processes, one container and one shared journal. The property that matters is
-that **nothing grades itself**: the orchestrator acts, the ground-truth ledger records
-what actually happened, and they are different processes.
+![System topology](docs/images/architecture.drawio.svg)
 
 | Port | Process | Role |
-| --- | --- | --- |
-| 8000 | dashboard | read-only; never drives execution |
-| 8100 | ledger | ground truth, the oracle |
-| 8101 | ticket | reversible effect |
-| 8102 | channel | reversible effect |
-| 8103 | pager | **irreversible and unobservable** |
-| 6379 | redis | alert stream (optional) |
+|---|---|---|
+| 6379 | Redis (Docker) | alert stream, consumer group, at-least-once delivery |
+| n/a | `sluice orchestrator` (x2) | leader + standby, sharing one SQLite journal and a lease |
+| 8100 | ledger | ground truth: what actually happened. **The oracle** |
+| 8101 | ticket | compensatable, observable |
+| 8102 | channel | compensatable, externally visible |
+| 8103 | pager | **irreversible and unobservable**: no undo, no status query |
+| 8000 | dashboard | read-only; reads the journal, never drives execution |
 
-The pager is the hard case by construction. A ticket can be closed and a post can be
-deleted, and both can be queried after a timeout. A phone call can be neither undone
-nor asked about, which is why `unknown` is its own outcome rather than a synonym for
-`failed`.
+The effect services are separate OS processes behind real sockets, so crashes, timeouts and
+partitions are real events. A read timeout is `unknown`, not `failed`: slow and crashed are
+indistinguishable. Two orchestrators race for a per-workflow lease with a monotonically
+increasing epoch, and the services fence off stale epochs (HTTP 409). A deposed leader is
+refused by the services rather than trusted to stand down. More in
+[docs/architecture.md](docs/architecture.md).
 
----
+## Key features
 
-## Setup
+- **Branch-tree journal** on SQLite in WAL mode with `synchronous=FULL`: intent is durable
+  before every effect, so recovery is never blind.
+- **Divergent recovery**: forks at the decision, picks the highest-ranked untried
+  alternative, and is bounded (fork depth 3, then escalate) so it cannot livelock.
+- **The bounded irreversible barrier**, with saga-style LIFO compensation and escalation
+  on exhaustion.
+- **Irreversible residue**: a page that already rang on an abandoned branch is recorded as
+  permanent residue, and the corrected page carries a *supersede* annotation naming it.
+- **Bounded ambiguity**: timeouts on unobservable effects become a surfaced `unknown`. A
+  page that lands late is caught on its idempotency key instead of paging twice.
+- **Failover with fencing tokens**: lease + epoch in the journal, enforced by the services.
+- **At-least-once ingest absorbed**: the workflow id is derived from the alert id, so a
+  redelivered alert lands on the same workflow and replays to a no-op.
+- **An oracle, not a self-assessment**: the EEO checker compares the journal with the
+  out-of-process ledger, and a **crash sweep** injects a crash at every step boundary under
+  five fault modes.
+- **Same engine, two worlds**: `InProcessWorld` and `HttpWorld` implement one `World`
+  protocol, and the tests assert they produce identical outcomes.
+- **Observability**: a live dashboard (gate state, branch tree, scoreboard, phones) and a
+  Markdown incident post-mortem rendered from the branch tree.
 
-Requires **Python 3.10+**.
+## Tech stack
 
-```bash
-python -m venv .venv
-.venv\Scripts\activate           # Windows
-source .venv/bin/activate        # macOS / Linux
-pip install -r requirements.txt
+| Area | Technology | Why |
+|---|---|---|
+| Language | Python 3.10+ | dataclasses and `Protocol` for the frozen interfaces |
+| Durable state | SQLite in WAL mode (`sqlite3`, stdlib) | one file, crash-safe, shared by both orchestrators |
+| Effect services, ledger, dashboard | FastAPI + uvicorn + pydantic | small, typed HTTP services; one app parameterised by service |
+| HTTP client | httpx | separate connect vs read timeouts, which is what distinguishes `failed` from `unknown` |
+| Ingest | Redis Streams (redis-py), Docker Compose | consumer groups, pending-entry lists, `XAUTOCLAIM` for dead consumers |
+| Dashboard UI | one HTML page, vanilla JS + inline SVG | polls the read-only API; no build step |
+| Testing | pytest (351 tests), ruff | unit, integration, multi-process and failover tests |
+| Ops | `scripts/verify.sh` (bash), `scripts/verify.bat` (Windows + WSL) | one-command end-to-end verification |
+
+The kernel (journal, branch tree, barrier, compensation, EEO checker, in-process world) is
+**standard library only**: the core demo runs with no third-party packages at all.
+
+## Project structure
+
+![Code architecture](docs/images/code-architecture.drawio.svg)
+
+```
+src/sluice/
+├── core/            durable-execution kernel (stdlib only)
+│   ├── types.py         frozen interfaces: EffectType, ToolResult, JournalRecord, Branch, World
+│   ├── journal.py       SQLite-WAL branch tree, leases, fencing epochs
+│   ├── tools.py         the incident-triage workflow: 8 tools, effect types, scripted agent
+│   └── engine.py        orchestrator: replay, divergence, barrier, compensation, escalation
+├── world/           effect layer behind the World protocol
+│   ├── inprocess.py     InProcessWorld: in-memory effects + fault injection
+│   ├── faults.py        FaultConfig and named presets (poison, zombie, clear)
+│   ├── ledger.py        the ground-truth ledger
+│   ├── http_client.py   HttpWorld, HttpLedger: same protocol over HTTP
+│   └── services.py      FastAPI effect services and ledger service
+├── ingest.py        alert sources: Redis Streams consumer group, in-process fallback
+├── observability/   journal -> dashboard state (view.py), incident post-mortem (audit.py)
+├── verification/    EEO checker, crash sweep, overhead benchmark
+├── scenarios/       the seven runnable scenarios, and the failover demo
+├── dashboard/       read-only FastAPI dashboard + static page
+└── cli/             the `sluice` command, one module per subcommand
+tests/
+├── unit/            one module at a time, synthetic inputs (257 tests)
+└── integration/     scenarios, real sockets, Redis, multi-process failover (94 tests)
+scripts/             verify.sh (Linux/WSL), verify.bat (Windows host)
+docs/                architecture, design, verification, WSL + Docker, CLI, testing
 ```
 
-**The core demo needs nothing from `requirements.txt`.** The journal, branch tree,
-barrier, bounded escalation, compensation driver, EEO checker and `InProcessWorld`
-are stdlib only. Install the requirements for the HTTP topology, the dashboard,
-Redis ingest and the tests.
+## Quick start
 
----
-
-## Verify the whole thing in one command
-
-```bat
-verify.bat
-```
-
-Cleans stale journals and caches, starts Redis and the four effect services, then runs
-the tests, the demo, the topology smoke test and a real distributed run end to end.
-Expected last line is `ALL CHECKS PASSED` with exit code 0. Step-by-step notes, and
-what each check proves, are in [`VERIFY.md`](VERIFY.md).
-
----
-
-## Run it
+Requires Python 3.10+. On Windows, run everything inside WSL2 (see
+[docs/wsl-docker.md](docs/wsl-docker.md)).
 
 ```bash
-python demo.py                       # GATE 2: the poison step, three panes
-python demo.py --slow 0.35           # paced for the room
-python demo.py --scenario residue    # the double buzz and the supersede annotation
-python demo.py --scenario compfail   # compensation fails, the barrier escalates
-python demo.py --scenario compretry  # compensation fails, retries, and succeeds
-python demo.py --scenario zombie     # the page that times out and lands anyway
-python demo.py --scenario all        # every scenario in turn
-python demo.py --sweep               # the crash sweep, evidence table, escalation rate
-python demo.py --failover            # lease, epoch, fencing token
-python demo.py --bench               # what durable execution costs per decision
-pytest                               # invariant tests
+git clone <this repo> && cd signal_hack
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"            # the `sluice` command, HTTP + Redis extras, pytest
+
+sluice demo                    # the poison step, three recovery strategies side by side
+```
+
+No install at all is needed for the core demo: `PYTHONPATH=src python3 -m sluice demo`
+runs on the standard library alone.
+
+It runs the same failure through all three strategies. Pinned ends at `tickets 1 posts 1
+pages 0` (livelocked), naive at `tickets 2 posts 2 pages 1` (duplicates), and Sluice:
+
+```
+--- SLUICE      poison ---
+  outcome:       completed
+  tickets 1   posts 1   pages 1      (gross 2/2/1)
+  phone rang:    rota-Y
+  gate:          [RELEASED] cleanup proven, gate lifted
+  EEO:           PASS
+...
+  unexplained violations:    0    <- this is the number that matters
+```
+
+`gross 2/2/1` is the honest part: the abandoned branch's ticket and post really happened,
+and were compensated.
+
+More scenarios:
+
+```bash
+sluice demo --scenario residue         # the wrong page already rang: residue + supersede
+sluice demo --scenario compfail        # cleanup fails for good: the barrier escalates
+sluice demo --scenario compretry       # cleanup fails once, then succeeds
+sluice demo --scenario zombie          # the page times out, is surfaced, lands late
+sluice demo --scenario crash           # crash between an effect and its journal record
+sluice demo --scenario all --flush-late
+sluice demo --slow 0.35                # paced and narrated, for watching
+sluice demo --sweep                    # the crash sweep and evidence table
+sluice demo --failover                 # lease, epoch, fencing token
+sluice demo --bench                    # what durability costs per step
 ```
 
 The dashboard, in a second terminal:
 
 ```bash
-python run_dashboard.py                  # http://127.0.0.1:8000, read-only
-python run_dashboard.py --allow-control  # adds the Run buttons on the page
-python demo.py --slow 0.35               # drives it from a terminal instead
+sluice dashboard --allow-control   # http://127.0.0.1:8000, with Run buttons
 ```
 
-Six tabs: **Live** (the three panes plus the distributed run), **Architecture**,
-**Scenarios**, **Edge cases**, **Analysis** and **Guide**, which explains every element
-on the page. Keys `1`-`6` switch tabs and the toggle top-right flips light/dark.
-
-With `--allow-control` the Live tab gets two buttons. **Run** executes a scenario
-across all three panes. **Run distributed** drives the real thing — producer, Redis,
-orchestrator, HTTP services — into the gold pane above them. That pane is not a fourth
-strategy; it is palimpsest again, over real sockets instead of in-process.
-
-Each pane shows its **EEO verdict**. The dashboard cannot compute one — grading needs
-the ledger, and a verdict a process grades for itself is worth nothing — so whichever
-process held the ledger writes it beside the journal and the dashboard displays it.
-
----
-
-## Running it as an actual distributed system
-
-Everything above runs in one process against `InProcessWorld`. That is a faithful
-model of the failure semantics, but it is a model: a "partition" is a boolean and a
-"crash" is an exception. The topology below is the real thing — separate OS processes,
-real sockets, real timeouts, a fencing token refused across a network boundary.
-
-**Start the effect layer** (four processes: ledger, ticket, channel, pager):
+## Running it as a distributed system
 
 ```bash
-python run_services.py
+docker compose up -d                   # Redis on :6379 (run from the repo root)
+sluice services                        # ledger + ticket + channel + pager, 4 processes
+sluice smoke                           # 20 checks over real sockets and the stream
+
+sluice faults poison                   # rota-X has nobody on call
+sluice producer --demo --count 1       # publish the alert
+sluice orchestrator --once --narrate
 ```
 
-**Verify it before trusting it.** Nothing in the HTTP or Redis path is covered by
-`pytest`, so check each layer independently:
+The orchestrator consumes from Redis, drives the services over HTTP, journals to
+`.sluice/shared.db`, and grades itself against the ledger:
+
+```
+[ingest] redis stream alerts:incoming group orchestrators
+    [orch-a] barrier_blocked 2 uncompensated effects on abandoned branch
+    [orch-a] compensated post_to_channel
+    [orch-a] compensated create_ticket
+    [orch-a] barrier_released page_oncall
+  a-1001: completed   rota=rota-Y       146ms  EEO PASS
+```
+
+For a real leader race, run two orchestrators with different `--owner` values against the
+same `--db`, and `kill -9` the leader mid-workflow. The standby reclaims the stalled alert
+from Redis (`XAUTOCLAIM`), takes the lease once the dead leader's expires, resumes from the
+journal at a higher epoch, and finishes with exactly one page. The test suite automates
+exactly this, killing the leader in the middle of compensation.
+
+## Testing and verification
 
 ```bash
-python smoke.py            # deps, services, idempotency, fencing, timeouts, Redis
-python smoke.py --http     # just the effect layer
-python smoke.py --redis    # just the stream
+pytest                      # 351 tests: unit + integration (spawns its own services)
+pytest tests/unit           # the fast layer, a few seconds
+scripts/verify.sh           # everything, end to end, against real Redis in Docker
 ```
 
-**Run the demo against it** — same code above `World`, one flag:
+- **Unit tests** pin each module with synthetic inputs, so a failure names the rule that
+  broke: each EEO clause, the barrier scope, LIFO order, lease epochs, fault modes.
+- **Integration tests** run every scenario under every strategy (21 panes, journal
+  cross-checked against the ledger) and exercise FastAPI apps through TestClient. They also
+  launch the four services as real processes on free ports, use Redis (DB 15, never your
+  data), and run the full producer → Redis → orchestrator → HTTP pipeline, including a
+  `kill -9` of the leader mid-compensation.
+- **Architecture guards** fail the build if a layer imports upward, if the kernel gains a
+  third-party import, or if `requirements.txt` drifts from `pyproject.toml`.
+- **`scripts/verify.sh`** cleans stale state, starts Redis and the services, runs the
+  suite, the demo, smoke, and the Redis pipeline (fresh run, replay, redelivery), then
+  tears everything down. Expected last line: `ALL CHECKS PASSED`.
 
-```bash
-python demo.py --world http
-```
+See [docs/testing.md](docs/testing.md) for the test map and a root-cause playbook, and
+[docs/verification.md](docs/verification.md) for what each verification step proves.
 
-**The stream** (optional; falls back to an in-process queue if Redis is unreachable):
+## Results
 
-```bash
-docker compose up -d
-python run_producer.py --count 20 --rate 4
-python run_producer.py --stats            # depth, lag, pending entries
-```
+**Every scenario, every strategy** (`sluice demo --scenario all`):
 
-Docker Engine inside WSL2 works as well as Docker Desktop; the container publishes
-6379 to the host either way, so `REDIS_URL` needs no change. If the orchestrator
-prints `[ingest] redis unavailable ... falling back to in-process queue`, the run
-proves nothing about the stream — that line is the one to watch for.
+| Scenario | Stresses | Pinned | Naive | **Sluice** |
+|---|---|---|---|---|
+| poison | wrong class, page fails | 1/1/0 livelock · FAIL | 2/2/1 · FAIL | **1/1/1 · PASS** |
+| residue | wrong page already rang | 1/1/1 · PASS* | 2/2/2 · FAIL | **1/1/2 · PASS**, supersedes |
+| compfail | cleanup fails for good | livelock · FAIL | 2/2/1 · FAIL | **escalates · PASS** |
+| compretry | cleanup fails once | livelock · FAIL | 2/2/1 · FAIL | **1/1/1 · PASS** |
+| zombie | page times out, lands late | escalates · PASS | escalates · PASS | **escalates · PASS** |
+| crash | crash at a step boundary | livelock · FAIL | 2/2/1 · FAIL | **1/1/1 · PASS** |
+| redelivery | same alert twice | 1/1/1 · PASS | 2/2/2 · FAIL | **1/1/1 · PASS** |
 
-**Two orchestrators, racing for real.** This is what makes it a distributed system
-rather than a client calling servers — real concurrency, real lease contention, and a
-deposed leader refused by a real service over a real socket:
+\* Pinned passes `residue` while paging the wrong rota: EEO is a claim about effects, not
+judgement. That is why the branch tree and the barrier exist.
 
-```bash
-python run_orchestrator.py --owner orch-a --source redis --world http
-python run_orchestrator.py --owner orch-b --source redis --world http   # other terminal
-python run_producer.py --count 20 --rate 4                             # third terminal
-```
-
-Both point at the same journal file (`--db`, default `.palimpsest/shared.db`) — that
-is the shared state at the centre of the 3.1 topology. Now:
-
-- **`kill -9` the leader mid-workflow.** The standby takes the lease after the TTL,
-  the epoch increments, and the workflow resumes from the journal. If the dead leader
-  ever comes back, the pager service refuses it — it is not trusted to stand down.
-- **`kill -9` the ticket service.** Watch the barrier try to compensate, fail, and
-  escalate within the deadline rather than hanging.
-- **Kill an orchestrator between delivery and ack.** The alert stays pending in the
-  consumer group; the surviving orchestrator reclaims it with `XAUTOCLAIM` and
-  re-runs it. Re-running is safe because the workflow id is derived from the alert id,
-  so the journal absorbs the repeat.
-
-Faults can also be injected live, without killing anything:
-
-```bash
-curl -X POST localhost:8101/admin/faults -H 'content-type: application/json' \
-     -d '{"down_services":["ticket"]}'
-curl -X POST localhost:8103/admin/faults -H 'content-type: application/json' \
-     -d '{"latency_s":3.0}'          # exceeds the 2s client timeout -> real unknown
-```
-
-### What is real here, and what still is not
-
-Real: separate OS processes with distinct pids, real sockets, genuine read timeouts
-(the services deliberately do **not** enforce the caller's deadline, so slow really is
-indistinguishable from crashed), connection-refused distinguished from timeout,
-per-workflow epoch fencing enforced by the service, Redis consumer groups with
-pending-entry recovery, and one shared SQLite journal under WAL.
-
-Still not real: crash injection inside the sweep is an in-process exception rather
-than a killed process, so `--sweep --world http` exercises a real effect layer with a
-simulated orchestrator death. Killing the orchestrator by hand (above) is the real
-version; the sweep does not automate it.
-
-**One thing the HTTP path needs that the in-process path does not:** the services are
-long-lived and every demo pane runs the same alert, hence the same workflow id. Pane
-one leaves the epoch high-water mark above where pane two starts, which would fence
-pane two out entirely. `make_ctx` resets the services and the ledger between panes for
-exactly this reason — the equivalent of the fresh `InProcessWorld` each pane gets
-in-process.
-
----
-
-## What you should see
-
-`python demo.py` runs one crash through three engines that differ only in four
-capability flags — same journal, same tools, same effect layer.
+**Crash sweep** (`sluice demo --sweep`): a crash at every step boundary (8 steps × 4
+phases + a clean run = 33 crash points) under 5 fault modes:
 
 ```
-              tickets  posts  pages   outcome
-PINNED           1       1      0     livelocked, nobody paged
-NAIVE            2       2      1     duplicate ticket, duplicate post, no cleanup
-PALIMPSEST       1       1      1     forked, gate held on 2 uncompensated,
-                                      drained LIFO, gate lifted, rota-Y paged once
+total runs:                165
+EEO clause 1 (no dup):     pass 165 / 165
+EEO clause 2 (no loss):    pass 165 / 165
+EEO clause 3 (clean abd):  pass 165 / 165
+escalation rate:           60.0%      crash 0% · partition-transient 0% · timeout, partition,
+                                      late-delivery 100% (permanent faults, by construction)
+unexplained violations:    0
 ```
 
-`--scenario residue` is the harder version, where the wrong page already succeeded:
-
-```
-PINNED           1       1      1     committed the misclassification (rota-X)
-NAIVE            2       2      2     two phones ring, the second explains nothing
-PALIMPSEST       1       1      2     residue recorded, second page supersedes the first
-```
-
-Palimpsest's 2 there is not a bug and not a hedge. The rota-X page is irreversible
-and already rang; it is recorded as permanent residue and the rota-Y page carries a
-supersede annotation naming it. A second phone ringing is acceptable when the second
-ring explains the first (2.4).
-
----
-
-## Layout
-
-```
-palimpsest/types.py        frozen interfaces (Part 4)
-palimpsest/journal.py      SQLite WAL journal, branch tree, lease + fencing epoch
-palimpsest/engine.py       orchestrator: barrier, compensation driver, divergence,
-                           escalation, reconciliation        <- review this by hand
-palimpsest/tools.py        the eight tools, effect types, scripted trace
-palimpsest/world.py        ground-truth ledger, InProcessWorld, fault injection
-palimpsest/http_world.py   HttpWorld + HttpLedger, same Protocol, flag swap
-palimpsest/services.py     the three effect services and the ledger service (FastAPI)
-palimpsest/ingest.py       AlertSource: Redis Streams + in-process fallback
-palimpsest/checker.py      the EEO checker (3 clauses), evidence table, escalation rate
-palimpsest/sweep.py        crash at every boundary x every fault mode
-palimpsest/bench.py        the overhead benchmark, decomposed by layer
-palimpsest/view.py         journal -> dashboard state (pure functions)
-palimpsest/dashboard.py    read-only dashboard server
-palimpsest/static/         the dashboard itself
-palimpsest/audit.py        branch tree rendered as an incident post-mortem
-palimpsest/failover.py     two orchestrators, lease, epoch, fencing
-palimpsest/scenarios.py    the seven runnable scenarios
-
-demo.py                    the three-pane demo, sweep, benchmark, failover
-smoke.py                   layer-by-layer check of the HTTP and Redis topology
-run_services.py            ledger + ticket + channel + pager, one process each
-run_orchestrator.py        one orchestrator process; run two for a real leader race
-run_producer.py            synthetic alerts into the Redis stream
-run_dashboard.py           read-only dashboard server
-
-tests/test_invariants.py   24 invariant tests
-conftest.py                puts the repo root on sys.path for pytest
-verify.bat                 one-command end-to-end verification
-VERIFY.md                  what each check proves, and its expected output
-docker-compose.yml         Redis for the alert stream
-requirements.txt           HTTP topology, dashboard, Redis, tests
-```
-
----
-
-## The three ideas
-
-**The journal is a tree, not a log.** Recovery that wants a different path forks a
-branch and marks the old one abandoned. The journal records what we tried, not just
-what we did. Institutional Memory for decisions that were rejected.
-
-**Tool calls are typed by effect.** `pure` / `idempotent` / `compensatable` /
-`irreversible`, crossed with `observable` / `unobservable`. This makes recovery
-decidable instead of heuristic.
-
-**The irreversible barrier.** A branch may not execute an irreversible effect while
-**any abandoned branch in the same workflow** holds uncompensated compensatable
-effects. Workflow scope, not sibling scope — fork twice and the first abandoned
-branch becomes an aunt and would slip a sibling check (2.2).
-
-The barrier is **bounded**. Compensation is retried to a deadline. On exhaustion the
-workflow does not silently proceed and does not hang: it writes an escalation
-carrying the branch tree and the uncompensated effect list, and surfaces it to a
-human (2.3). The terminal states are *acted with proof of cleanup* or *escalated with
-a full account of why*. Never lost, never silent.
-
----
-
-## Correctness
-
-Effect-Exactly-Once, after crash, recovery and quiescence:
-
-1. **No duplication.** No irreversible effect commits more than once per logical
-   decision point, identified by its idempotency key. A second irreversible effect is
-   legitimate only when it carries a supersede annotation naming the first.
-2. **No loss.** Every workflow terminates in a committed action or a surfaced
-   escalation. Never silently, never still running.
-3. **Clean abandonment.** Every compensatable effect on an abandoned branch has a
-   matching compensation, in reverse order, and no effect on an active branch is
-   compensated.
-
-**Bounded Ambiguity.** At most one irreversible + unobservable effect may sit in
-unknown state per workflow, and it is surfaced, never silently resolved. Clause 2 is
-what makes that safe: an unknown page still terminates in a surfaced escalation, so
-the signal is not lost even when the effect status is not knowable.
-
-All three clauses are checked against the **ground-truth ledger**, which sits outside
-the system and records what actually happened to the world, independently of what the
-system journaled or believed. `python demo.py --sweep` emits the evidence table; the
-line that matters is `unexplained violations`.
-
-**Explained vs unexplained.** A clause-3 shortfall accompanied by an escalation record
-naming those exact effects is an *explained* violation — the honest degraded outcome
-of 2.3, not a bug. Only unexplained violations count against the system.
-
-**EEO does not claim the decision was right.** In `--scenario residue`, pinned replay
-passes all three clauses while paging the wrong rota. Exactly-once is a claim about
-effects, not about judgement. That is why the branch tree and the barrier exist.
-
----
-
-## The numbers
-
-Two commands produce every number that gets quoted. Neither is estimated.
-
-**`python demo.py --sweep`** — the evidence table (§2.8), plus a per-fault-mode
-breakdown and the escalation-reason histogram.
-
-- `unexplained violations` is the headline. If it is not zero, that is a real bug.
-- `escalation rate` is the answer to §7.6's *"why not have a human approve every
-  irreversible action?"* — the barrier automates up to the irreversible step and
-  escalates only genuinely ambiguous cases, and this is how often that happens under
-  fault. The reason histogram says *what* forced a human in, which is the follow-up
-  question.
-- The per-fault-mode table matters because the rate is not uniform, and quoting the
-  headline percentage alone is misleading in both directions. Under `crash` — the
-  fault durable execution is actually built for — the rate is **0%**: every run acted,
-  with cleanup proven. The permanent-outage modes escalate every time by construction.
-  `partition-transient` is the middle case, where the service returns before the
-  retry budget is spent and the drain completes.
-
-**`python demo.py --bench`** — the overhead benchmark (§7.6's *"what does the
-overhead cost?"*). It reports four configurations rather than one number, because one
-number would hide the only interesting thing:
-
-```
-bare tool calls                 the floor, no durability
-+ journal (:memory:)            bookkeeping only, SQLite I/O removed
-+ journal, synchronous=NORMAL   on disk, no fsync per commit
-+ journal, synchronous=FULL     what we ship
-```
-
-FULL minus NORMAL is the fsync bill and it dominates. That is a deliberate purchase,
-not waste: a crash between the `INTENT` record and the effect must not lose the
-`INTENT` record, or recovery cannot know the step was started and the effect commits
-with nothing pointing at it. `synchronous=NORMAL` is a supported knob
-(`Journal(path, synchronous="NORMAL")`) and the benchmark prices exactly what
-relaxing it buys back.
-
-It then repeats the bare-vs-durable comparison with a realistic per-effect latency
-injected into **both** rows (`--bench-effect-latency-ms`, default 25). The in-process
-floor is eight dict writes, so dividing by it yields a true but useless multiple —
-nothing pages an engineer that way. The latency is simulated, but applied identically
-to both rows it cancels, so the ratio is *measured* rather than extrapolated.
-
-**Quote `ms per step` and the realistic ratio. Never quote the multiple-of-bare.**
-
-`--bench-concurrency K` additionally measures K threads sharing one journal. That is
-single-process SQLite contention, **not** the distributed scale run of §5.7, and the
-output labels it as such.
+**Overhead** (`sluice demo --bench`, measured on WSL2 / ext4): durability costs
+**~3.3 ms per step**, ~92 % of it the per-commit fsync that keeps an `INTENT` record from
+being lost. Against a realistic effect layer (25 ms per call) that is **1.26× (+26 %)**.
 
 ## Where it falls over
 
-- **Exactly-once for irreversible + unobservable effects is impossible.** Two
-  generals. We bound the ambiguity to one place and report it.
-- **Compensation restores state, not history.** A deleted channel post was still
-  seen. An irreversible effect on an abandoned branch is permanent residue, recorded
-  and superseded, never silently erased.
-- **The barrier is bounded, not absolute.** If compensation cannot complete we
-  escalate to a human rather than blocking or acting blind. A degraded outcome,
-  chosen deliberately over the two alternatives.
-- **Agent decisions are scripted.** Reproducible, but not proof of behaviour at
-  scale. There is no live model call in this build.
-- **Fault coverage is not proof.** The sweep covers crash / timeout / partition /
-  late-delivery at every step boundary. It does not cover byzantine services,
-  clock skew, or SQLite corruption.
-- **The overhead number is a single-machine, in-process figure.** It isolates the
-  durability machinery from the network on purpose. Over `HttpWorld` every
-  configuration moves by the same network constant, so the comparison between rows
-  holds, but the absolute number does not transfer.
-- **Failover is single-host.** `run_orchestrator.py` gives two real orchestrator
-  processes racing for one lease against a real effect layer, which is genuine
-  concurrency and genuine fencing — but all on one machine. Node loss across two
-  physical hosts, and network partitions between them, are not exercised.
-- **The sweep's crashes are in-process.** `--sweep --world http` runs a real effect
-  layer with a simulated orchestrator death. Killing the orchestrator for real is a
-  manual step, not part of the swept evidence.
+- **Exactly-once for irreversible + unobservable effects is impossible** (two generals).
+  The ambiguity is bounded to one place and reported, never silently resolved.
+- **Compensation restores state, not history.** A deleted channel post was still seen.
+- **The barrier is bounded, not absolute.** When cleanup cannot complete it escalates to a
+  human. That is a degraded outcome, chosen deliberately over hanging or acting blind.
+- **The agent is scripted.** Decisions come from a scripted trace with ranked
+  alternatives; there is no live model call.
+- **Single host.** Two real orchestrator processes race for one lease, but on one machine;
+  partitions between hosts are not exercised.
+- **Fault coverage is not proof.** The sweep covers crash, timeout, partition and late
+  delivery at every boundary, not byzantine services, clock skew or disk corruption.
 
----
+## Documentation
 
-## Deviations from Part 4
-
-Part 4 is frozen. Two changes were necessary and are called out rather than hidden:
-
-1. **`effect_key` returns `"{workflow_id}:{sha256(wf|branch|seq)[:16]}"`** instead of
-   a bare digest. Still derived from exactly the three inputs Part 4 names, still
-   stable across epochs. Per-workflow epoch fencing (3.4) and the multi-workflow
-   crash sweep (2.8) both need the workflow to be recoverable from a key, and an
-   opaque digest cannot provide it.
-2. **`World` carries `compensate`.** Part 4 puts `compensate` on `Tool` but omits it
-   from `World`, and the compensation driver has nowhere else to call.
-
-Nothing else in Part 4 changed. `ResultStatus`, `RecordKind`, `Branch.status`,
-`Branch.depth`, `JournalRecord.ts` / `.detail` and the `timeout_s` parameters are all
-as specified, and every `RecordKind` is now actually emitted.
-
----
-
-## Knobs
-
-| Knob | Where | Note |
-| --- | --- | --- |
-| `MAX_FORK_DEPTH` | `engine.py`, or `max_fork_depth=` | 3. Say the number out loud. |
-| `MAX_COMP_ATTEMPTS` / `BARRIER_DEADLINE_S` | `engine.py`, or per-Orchestrator | the bounded barrier |
-| `--late-delay` | `demo.py` | 8 on stage, 40 in the sweep (3.3) |
-| `--slow` | `demo.py` | pause between steps so the room can watch |
-| `--narrate` / `--slow` | `demo.py` | stream events live; `--slow` implies it |
-| `--world http` | `demo.py` | flag swap to the HTTP topology |
-| `synchronous` | `Journal(path, synchronous=)` | `FULL` (default), `NORMAL`, `OFF`. `--bench` prices the difference. |
-| `faults.*` | `world.py` `FaultConfig` | latency, jitter, fail, timeout, down, empty rotas |
-| `POST /admin/faults` | any effect service | same knobs, live, over HTTP |
-
----
-
-## Not built
-
-- Live model call at step 3 (first on the 8.2 cut list; the trace is scripted).
-- The concurrent scale run of §5.7: Redis stream lag and p99 under a sustained
-  producer. `--bench-concurrency` measures single-process journal contention, which
-  is a different and smaller claim. No lag number is quoted.
-- Topology strip animation on the live `kill -9`; the strip renders service health
-  and the current epoch, but does not animate packets.
+| Document | What is in it |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | components, data model, journal schema, the recovery algorithm, fencing |
+| [docs/design.md](docs/design.md) | the design decisions and the scenario analysis, in two pages |
+| [docs/cli.md](docs/cli.md) | every command and flag, environment variables, HTTP APIs, tuning knobs |
+| [docs/testing.md](docs/testing.md) | test map, how to run subsets, root-cause playbook |
+| [docs/verification.md](docs/verification.md) | `verify.sh` step by step, expected output, reading failures |
+| [docs/wsl-docker.md](docs/wsl-docker.md) | running on WSL2 with Docker, and the pitfalls already hit |
