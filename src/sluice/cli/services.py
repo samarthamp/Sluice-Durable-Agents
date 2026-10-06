@@ -28,9 +28,16 @@ def serve_one(name: str, port: int, ledger_url: str, host: str) -> None:
     uvicorn.run(app, host=host, port=port, log_level="warning")
 
 
+def _stop_on_sigterm(_signum, _frame) -> None:
+    # Route SIGTERM through the same cleanup as Ctrl-C, so `kill <pid>` on the
+    # supervisor stops its four children instead of orphaning them.
+    raise KeyboardInterrupt
+
+
 def serve_all(host: str, ledger_url: str) -> int:
     procs: list[tuple[str, subprocess.Popen]] = []
     env = child_env()
+    previous = signal.signal(signal.SIGTERM, _stop_on_sigterm)
 
     try:
         for name in SERVICES:
@@ -58,6 +65,7 @@ def serve_all(host: str, ledger_url: str) -> int:
     except KeyboardInterrupt:
         print("\n  stopping...", flush=True)
     finally:
+        signal.signal(signal.SIGTERM, previous)
         for _name, p in procs:
             if p.poll() is None:
                 try:
