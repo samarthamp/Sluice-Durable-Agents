@@ -105,12 +105,28 @@ class Journal:
             self.conn.execute(f"PRAGMA synchronous={synchronous}")
             self.conn.executescript(SCHEMA)
         self.conn.execute("PRAGMA busy_timeout=5000")
-        # BEGIN IMMEDIATE serialises lease acquisition across processes, but not across
-        # threads sharing this one connection; this lock covers that case.
-        self._tx_lock = threading.Lock()
+        # One connection, possibly shared by several threads (the benchmark's workers,
+        # the dashboard's control threads). sqlite3 does not make concurrent use of a
+        # connection safe from Python -- statements interleave and a fetch can return
+        # another thread's row -- so every statement runs under this lock, fetch
+        # included. BEGIN IMMEDIATE still serialises lease acquisition across processes.
+        self._lock = threading.RLock()
 
     def close(self) -> None:
-        self.conn.close()
+        with self._lock:
+            self.conn.close()
+
+    def _write(self, sql: str, params: tuple = ()) -> int:
+        with self._lock:
+            return self.conn.execute(sql, params).lastrowid
+
+    def _fetchall(self, sql: str, params: tuple = ()) -> list:
+        with self._lock:
+            return self.conn.execute(sql, params).fetchall()
+
+    def _fetchone(self, sql: str, params: tuple = ()):
+        with self._lock:
+            return self.conn.execute(sql, params).fetchone()
 
     # ---------------------------------------------------------------- records
 
@@ -128,7 +144,7 @@ class Journal:
         result: ToolResult | None = None,
         detail: dict | None = None,
     ) -> int:
-        cur = self.conn.execute(
+        return self._write(
             "INSERT INTO records (ts, workflow_id, branch_id, seq, kind, tool_name,"
             " effect_type, args, key, epoch, result, detail)"
             " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -147,7 +163,6 @@ class Journal:
                 _dumps(detail),
             ),
         )
-        return cur.lastrowid
 
     def _row_to_record(self, r) -> JournalRecord:
         return JournalRecord(
@@ -167,30 +182,30 @@ class Journal:
         )
 
     def records(self, workflow_id: str) -> list[JournalRecord]:
-        rows = self.conn.execute(
+        rows = self._fetchall(
             f"SELECT {_COLUMNS} FROM records WHERE workflow_id=? ORDER BY record_id",
             (workflow_id,),
-        ).fetchall()
+        )
         return [self._row_to_record(r) for r in rows]
 
     def branch_records(self, branch_id: str) -> list[JournalRecord]:
-        rows = self.conn.execute(
+        rows = self._fetchall(
             f"SELECT {_COLUMNS} FROM records WHERE branch_id=? ORDER BY record_id",
             (branch_id,),
-        ).fetchall()
+        )
         return [self._row_to_record(r) for r in rows]
 
     def workflows(self) -> list[str]:
-        rows = self.conn.execute(
+        rows = self._fetchall(
             "SELECT workflow_id, MIN(record_id) AS first FROM records"
             " GROUP BY workflow_id ORDER BY first"
-        ).fetchall()
+        )
         return [r[0] for r in rows]
 
     def latest_workflow(self) -> str | None:
-        row = self.conn.execute(
+        row = self._fetchone(
             "SELECT workflow_id FROM records ORDER BY record_id DESC LIMIT 1"
-        ).fetchone()
+        )
         return row[0] if row else None
 
     # --------------------------------------------------------------- branches
@@ -203,7 +218,7 @@ class Journal:
         depth: int = 0,
     ) -> Branch:
         bid = "br-" + uuid.uuid4().hex[:10]
-        self.conn.execute(
+        self._write(
             "INSERT INTO branches VALUES (?,?,?,?,?,?,?)",
             (
                 bid,
@@ -218,19 +233,19 @@ class Journal:
         return Branch(bid, parent_branch_id, fork_point_record_id, depth, "active")
 
     def branches(self, workflow_id: str) -> list[Branch]:
-        rows = self.conn.execute(
+        rows = self._fetchall(
             "SELECT branch_id, parent_branch_id, fork_point_record_id, depth, status"
             " FROM branches WHERE workflow_id=? ORDER BY created_ts, rowid",
             (workflow_id,),
-        ).fetchall()
+        )
         return [Branch(*r) for r in rows]
 
     def branch(self, branch_id: str) -> Branch | None:
-        row = self.conn.execute(
+        row = self._fetchone(
             "SELECT branch_id, parent_branch_id, fork_point_record_id, depth, status"
             " FROM branches WHERE branch_id=?",
             (branch_id,),
-        ).fetchone()
+        )
         return Branch(*row) if row else None
 
     def active_branch(self, workflow_id: str) -> Branch | None:
@@ -241,7 +256,7 @@ class Journal:
         return None
 
     def set_branch_status(self, branch_id: str, status: BranchStatus) -> None:
-        self.conn.execute("UPDATE branches SET status=? WHERE branch_id=?", (status, branch_id))
+        self._write("UPDATE branches SET status=? WHERE branch_id=?", (status, branch_id))
 
     def dead_branches(self, workflow_id: str) -> set[str]:
         return {
@@ -251,10 +266,10 @@ class Journal:
     # -------------------------------------------------------------- replay aids
 
     def next_seq(self, branch_id: str) -> int:
-        row = self.conn.execute(
+        row = self._fetchone(
             "SELECT MAX(seq) FROM records WHERE branch_id=? AND kind IN ('INTENT','RESULT')",
             (branch_id,),
-        ).fetchone()
+        )
         return 0 if row[0] is None else row[0] + 1
 
     def completed_results(self, branch_id: str) -> dict[int, JournalRecord]:
@@ -270,11 +285,11 @@ class Journal:
         return out
 
     def last_result(self, branch_id: str, seq: int) -> JournalRecord | None:
-        rows = self.conn.execute(
+        rows = self._fetchall(
             f"SELECT {_COLUMNS} FROM records WHERE branch_id=? AND seq=? AND kind='RESULT'"
             " ORDER BY record_id DESC LIMIT 1",
             (branch_id, seq),
-        ).fetchall()
+        )
         return self._row_to_record(rows[0]) if rows else None
 
     # ------------------------------------------------------- barrier predicates
@@ -335,7 +350,7 @@ class Journal:
         now = time.time()
 
         # Compare-and-swap inside a write transaction.
-        with self._tx_lock:
+        with self._lock:
             self.conn.execute("BEGIN IMMEDIATE")
             try:
                 self.conn.execute(
@@ -372,11 +387,11 @@ class Journal:
                 raise
 
     def lease_info(self, scope: str) -> LeaseInfo | None:
-        row = self.conn.execute(
+        row = self._fetchone(
             "SELECT owner, epoch, expires FROM leases WHERE scope=?", (scope,)
-        ).fetchone()
+        )
         return LeaseInfo(scope, row[0], row[1], row[2]) if row else None
 
     def expire_lease(self, scope: str) -> None:
         """Force the current lease to be expired."""
-        self.conn.execute("UPDATE leases SET expires=? WHERE scope=?", (0.0, scope))
+        self._write("UPDATE leases SET expires=? WHERE scope=?", (0.0, scope))

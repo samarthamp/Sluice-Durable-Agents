@@ -102,16 +102,20 @@ def _concurrent(db: str, threads: int, per_thread: int) -> dict:
     world = _fresh_world()
     journal = Journal(db, synchronous="FULL")
     samples: list[list[float]] = [[] for _ in range(threads)]
+    errors: list[BaseException] = []
     barrier = threading.Barrier(threads)
 
     def worker(t: int) -> None:
         barrier.wait()
-        for i in range(per_thread):
-            alert = _alert(100000 + t * per_thread + i)
-            orch = Orchestrator(journal, world, owner=f"orch-bench-{t}", mode="sluice")
-            t0 = time.perf_counter()
-            orch.run(alert, "P1")
-            samples[t].append(time.perf_counter() - t0)
+        try:
+            for i in range(per_thread):
+                alert = _alert(100000 + t * per_thread + i)
+                orch = Orchestrator(journal, world, owner=f"orch-bench-{t}", mode="sluice")
+                t0 = time.perf_counter()
+                orch.run(alert, "P1")
+                samples[t].append(time.perf_counter() - t0)
+        except BaseException as e:  # surfaced below; a thread's exception is otherwise lost
+            errors.append(e)
 
     workers = [threading.Thread(target=worker, args=(t,)) for t in range(threads)]
     started = time.perf_counter()
@@ -121,6 +125,10 @@ def _concurrent(db: str, threads: int, per_thread: int) -> dict:
         w.join()
     wall = time.perf_counter() - started
     journal.close()
+
+    # A dead worker would shrink the sample and still print a throughput figure.
+    if errors:
+        raise RuntimeError(f"{len(errors)} of {threads} benchmark threads failed") from errors[0]
 
     flat = [s for row in samples for s in row]
     out = _stats(flat)

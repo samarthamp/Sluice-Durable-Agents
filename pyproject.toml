@@ -53,7 +53,10 @@ testpaths = ["tests"]
 # Lets the suite run straight from a checkout, installed or not.
 pythonpath = ["src"]
 addopts = "-ra --strict-markers"
+# An exception in a background thread must fail the test that caused it, not scroll by
+# as a warning: that is how a race in the shared journal once stayed hidden.
 filterwarnings = [
+    "error::pytest.PytestUnhandledThreadExceptionWarning",
     # Starlette >= 1.x is moving its TestClient off httpx; the code under test is not.
     "ignore:Using `httpx` with `starlette.testclient` is deprecated",
 ]
