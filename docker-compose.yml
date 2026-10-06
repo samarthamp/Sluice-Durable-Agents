@@ -1,16 +1,20 @@
-# Redis Streams for the alert ingest (3.2).  One `docker compose up -d`.
+# Redis Streams for the alert ingest (3.2).
 #
-# Entirely optional: palimpsest.ingest.alert_source() falls back to an in-process
-# queue if Redis is unreachable, and says so on stdout.  Do not discover a Docker
-# problem with no plan B (8.1).
+#   docker compose up -d                 # from the repo root
+#   sluice producer --demo --count 1
+#   sluice orchestrator --once --narrate
 #
-#   docker compose up -d
-#   PALIMPSEST_REDIS=1 python demo.py
+# Optional: `sluice demo` never needs it, and the orchestrator falls back to an
+# in-process queue if Redis is unreachable, and says so on stdout.
+#
+# Keep this file at the repo root. container_name is pinned, and compose names the
+# project after this file's directory: moved elsewhere, `up` refuses the existing
+# container as belonging to another project (see docs/wsl-docker.md).
 
 services:
   redis:
     image: redis:7-alpine
-    container_name: palimpsest-redis
+    container_name: sluice-redis
     ports:
       - "6379:6379"
     command: ["redis-server", "--appendonly", "no", "--save", ""]

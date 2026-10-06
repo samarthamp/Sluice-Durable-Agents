@@ -1,0 +1,1302 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sluice</title>
+<style>
+/* Terminal-native stack.  Every face here ships with Windows, macOS or a dev
+   toolchain -- no webfont, no CDN, nothing to fail on a venue's guest wifi. */
+:root{
+  --mono:"JetBrains Mono","Cascadia Code","Cascadia Mono","Fira Code","SF Mono",
+         Menlo,Consolas,ui-monospace,monospace;
+
+  --bg:#0b0e13; --panel:#12171f; --panel2:#191f2a; --line:#28303d;
+  --ink:#dfe6f0; --dim:#8c98ab; --faint:#5c6675;
+  --ok:#3ddc97; --live:#4aa8ff; --bad:#ff5c5c; --warn:#ffb648;
+  --ghost:#3a4553; --gold:#ffd76e;
+  --board:rgba(11,14,19,.97);
+}
+:root[data-theme="light"]{
+  --bg:#f4f6f9; --panel:#ffffff; --panel2:#eceff4; --line:#d5dbe4;
+  --ink:#151922; --dim:#4d5666; --faint:#7b8494;
+  --ok:#0b8f5a; --live:#1667cc; --bad:#cc3333; --warn:#a06a00;
+  --ghost:#b2bac6; --gold:#8a6b00;
+  --board:rgba(255,255,255,.97);
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:13px/1.5 var(--mono);
+  -webkit-font-smoothing:antialiased}
+h1,h2,h3{margin:0;font-weight:600}
+.wrap{max-width:1500px;margin:0 auto;padding:14px 18px 88px}
+
+header{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:12px}
+header h1{font-size:19px;letter-spacing:.14em}
+header .sub{color:var(--dim);font-size:12px}
+header .tag{margin-left:auto;font:11px var(--mono);color:var(--faint)}
+header #theme{background:var(--panel);border:1px solid var(--line);color:var(--dim);
+  border-radius:7px;width:28px;height:26px;cursor:pointer;font:14px var(--mono);
+  line-height:1;padding:0}
+header #theme:hover{color:var(--ink);border-color:var(--faint)}
+
+/* ---------- topology strip (6.4) ---------- */
+.topo{display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+  background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  padding:9px 12px;margin-bottom:12px;font:11px var(--mono)}
+.topo .node{padding:4px 9px;border-radius:6px;border:1px solid var(--line);
+  background:var(--panel2);color:var(--dim)}
+.topo .node.up{color:var(--ok);border-color:rgba(61,220,151,.35)}
+.topo .node.down{color:var(--bad);border-color:rgba(255,92,92,.45)}
+.topo .node.leader{color:var(--gold);border-color:rgba(255,215,110,.45)}
+.topo .arrow{color:var(--faint)}
+.topo .label{color:var(--faint);text-transform:uppercase;letter-spacing:.1em}
+
+/* ---------- panes ---------- */
+.panes{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;align-items:start}
+@media (max-width:1180px){.panes{grid-template-columns:1fr}}
+.pane{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  padding:12px 13px;min-height:320px;min-width:0;display:flex;flex-direction:column;gap:9px;
+  overflow:hidden}
+.pane *{min-width:0}
+.pane .verdict{overflow-wrap:anywhere}
+.pane.hero{border-color:rgba(74,168,255,.4);box-shadow:0 0 0 1px rgba(74,168,255,.12)}
+.pane h2{font-size:12px;letter-spacing:.18em;text-transform:uppercase}
+.pane .verdict{font:11px var(--mono);color:var(--dim)}
+.pane .verdict b{font-weight:600}
+.v-lost{color:var(--bad)} .v-dup{color:var(--warn)} .v-good{color:var(--ok)}
+
+/* ---------- branch path ---------- */
+.branch{border-left:2px solid var(--line);padding:6px 0 6px 10px;margin:2px 0}
+.branch.dead{border-left-color:var(--ghost);opacity:.72}
+.branch.residue{border-left-color:var(--warn)}
+.branch-head{display:flex;gap:7px;align-items:center;font:10px var(--mono);
+  color:var(--faint);margin-bottom:5px;flex-wrap:wrap}
+.badge{padding:1px 6px;border-radius:99px;border:1px solid var(--line);
+  text-transform:uppercase;letter-spacing:.08em;font-size:9px}
+.badge.abandoned{color:var(--ghost);border-color:var(--ghost)}
+.badge.compensated{color:var(--ok);border-color:rgba(61,220,151,.4)}
+.badge.abandoned_with_residue{color:var(--warn);border-color:rgba(255,182,72,.5)}
+.badge.active{color:var(--live);border-color:rgba(74,168,255,.45)}
+
+.steps{display:flex;align-items:center;gap:3px;flex-wrap:wrap}
+.step{width:20px;height:20px;border-radius:5px;border:1px solid var(--line);
+  background:var(--panel2);position:relative;transition:background .55s,border-color .55s;
+  display:grid;place-items:center;font:9px var(--mono);color:var(--faint)}
+.step.ok{background:rgba(61,220,151,.16);border-color:rgba(61,220,151,.5);color:var(--ok)}
+.step.failed{background:rgba(255,92,92,.18);border-color:rgba(255,92,92,.55);color:var(--bad)}
+.step.unknown{background:rgba(255,182,72,.16);border-color:rgba(255,182,72,.55);color:var(--warn)}
+.step.in_flight{border-color:var(--live);color:var(--live)}
+.step.compensated{background:transparent;border-color:var(--ghost);color:var(--ghost)}
+/* uncompensated committed effect on a dead branch: bright and pulsing red (6.1) */
+.step.uncomp{background:rgba(255,92,92,.28);border-color:var(--bad);color:#fff;
+  animation:pulse 1.05s ease-in-out infinite}
+@keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(255,92,92,.55)}
+                 50%{box-shadow:0 0 0 5px rgba(255,92,92,0)}}
+.step.irr{border-radius:50%}
+/* never reached: the workflow stopped before this step.  Distinct from "pending",
+   which implies something is still coming. */
+.step.notreached{border-style:dashed;border-color:var(--ghost);color:var(--ghost);
+  background:transparent;opacity:.55}
+
+/* ---------- the gate (6.1) ---------- */
+.gate{margin-top:4px;border-radius:10px;padding:10px 12px;border:1px solid var(--line);
+  background:var(--panel2);display:flex;gap:11px;align-items:center;
+  transition:border-color .4s,background .4s}
+.gate .bars{display:flex;gap:3px;flex:0 0 auto}
+.gate .bar{width:5px;height:30px;border-radius:2px;background:var(--ghost);
+  transition:background .4s,transform .5s;transform-origin:top}
+.gate .txt{font:11px var(--mono);line-height:1.4}
+.gate .txt .st{text-transform:uppercase;letter-spacing:.14em;font-size:10px}
+.gate .cnt{margin-left:auto;font:22px var(--mono);font-weight:600}
+
+.gate.idle .txt .st{color:var(--faint)}
+.gate.idle .cnt{color:var(--faint)}
+
+.gate.blocked{border-color:rgba(255,92,92,.55);background:rgba(255,92,92,.09)}
+.gate.blocked .bar{background:var(--bad)}
+.gate.blocked .txt .st{color:var(--bad)}
+.gate.blocked .cnt{color:var(--bad)}
+
+.gate.released{border-color:rgba(61,220,151,.5);background:rgba(61,220,151,.08)}
+.gate.released .bar{background:var(--ok);transform:scaleY(.12)}
+.gate.released .txt .st{color:var(--ok)}
+.gate.released .cnt{color:var(--ok)}
+
+.gate.escalated{border-color:rgba(255,182,72,.6);background:rgba(255,182,72,.1)}
+.gate.escalated .bar{background:var(--warn)}
+.gate.escalated .txt .st{color:var(--warn)}
+.gate.escalated .cnt{color:var(--warn)}
+
+/* ---------- phones (6.2) ---------- */
+.phones{display:flex;gap:10px;align-items:flex-end;margin-top:auto;padding-top:8px}
+.phone{width:46px;height:76px;border-radius:9px;border:2px solid var(--line);
+  background:#0a0d12;position:relative;flex:0 0 auto;display:grid;place-items:center;
+  font:9px var(--mono);color:var(--faint);text-align:center;padding:3px}
+.phone.rang{border-color:var(--ok);color:var(--ok);background:rgba(61,220,151,.1);
+  animation:buzz .5s ease-in-out 2}
+.phone.dupe{border-color:var(--bad);color:var(--bad);background:rgba(255,92,92,.12);
+  animation:buzz .32s ease-in-out 4}
+.phone.superseded{border-color:var(--warn);color:var(--warn);background:rgba(255,182,72,.1)}
+@keyframes buzz{0%,100%{transform:translateX(0)}25%{transform:translateX(-3px) rotate(-2deg)}
+                75%{transform:translateX(3px) rotate(2deg)}}
+.phone-note{font:10px var(--mono);color:var(--dim);align-self:center;line-height:1.5}
+.phone-note .em{color:var(--bad)}
+.timer{font:26px var(--mono);font-weight:600;letter-spacing:.02em}
+.timer.burning{color:var(--bad)}
+.timer.done{color:var(--ok)}
+.timer small{display:block;font:10px var(--mono);font-weight:400;color:var(--faint);
+  letter-spacing:.08em;text-transform:uppercase}
+
+/* ---------- events ---------- */
+.events{margin-top:6px;border-top:1px solid var(--line);padding-top:7px;
+  font:10px var(--mono);max-height:120px;overflow-y:auto;color:var(--dim)}
+.events div{padding:1px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  max-width:100%}
+.ev-BARRIER_BLOCKED{color:var(--bad)} .ev-BARRIER_RELEASED{color:var(--ok)}
+.ev-ESCALATED{color:var(--warn)} .ev-BRANCH_FORKED{color:var(--live)}
+.ev-LATE_DELIVERY_SUPPRESSED{color:var(--gold)}
+.ev-BRANCH_ABANDONED{color:var(--ghost)} .ev-BRANCH_COMPENSATED{color:var(--ok)}
+
+/* ---------- scoreboard (6.3) ---------- */
+.board{position:fixed;left:0;right:0;bottom:0;background:var(--board);
+  border-top:1px solid var(--line);backdrop-filter:blur(8px);z-index:5}
+.board .inner{max-width:1500px;margin:0 auto;padding:9px 18px;
+  display:grid;grid-template-columns:150px repeat(3,1fr);gap:10px;align-items:center}
+.board .hd{font:10px var(--mono);color:var(--faint);text-transform:uppercase;
+  letter-spacing:.14em}
+.board .cell{display:flex;gap:16px;align-items:baseline}
+.board .num{font:20px var(--mono);font-weight:600}
+.board .num small{font:9px var(--mono);font-weight:400;color:var(--faint);display:block;
+  letter-spacing:.1em;text-transform:uppercase}
+.board .gross{font:10px var(--mono);color:var(--faint)}
+.n-zero{color:var(--bad)} .n-one{color:var(--ok)} .n-many{color:var(--warn)}
+.legend{font:10px var(--mono);color:var(--faint);margin-top:10px;
+  display:flex;gap:14px;flex-wrap:wrap}
+.legend b{color:var(--dim);font-weight:400}
+.missing{color:var(--faint);font:11px var(--mono);padding:24px 0;text-align:center}
+
+/* ---------- tabs ---------- */
+.tabs{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:12px;
+  border-bottom:1px solid var(--line);padding-bottom:0}
+.tabs button{background:none;border:1px solid transparent;border-bottom:none;
+  color:var(--dim);font:11px var(--mono);letter-spacing:.1em;text-transform:uppercase;
+  padding:8px 14px;border-radius:8px 8px 0 0;cursor:pointer;margin-bottom:-1px}
+.tabs button:hover{color:var(--ink);background:var(--panel)}
+.tabs button[aria-selected="true"]{color:var(--live);background:var(--panel);
+  border-color:var(--line);border-bottom:1px solid var(--panel)}
+.tabs .spacer{margin-left:auto;font:10px var(--mono);color:var(--faint);
+  align-self:center;padding-right:4px}
+
+/* ---------- static documentation cards ---------- */
+.doc{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+  padding:15px 17px;margin-bottom:12px}
+.doc h3{font-size:11px;letter-spacing:.18em;text-transform:uppercase;color:var(--live);
+  margin-bottom:10px}
+/* ~78ch is the readable-line ceiling; the old 96ch is why the prose read as a wall */
+.doc p{margin:0 0 10px;color:var(--dim);max-width:78ch;line-height:1.65}
+.doc p:last-child{margin-bottom:0}
+.doc code{font:11px var(--mono);color:var(--gold);background:var(--panel2);
+  padding:1px 5px;border-radius:4px}
+.doc .lede{color:var(--ink)}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:12px}
+.grid3{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px}
+
+/* cards for scenarios / edge cases */
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+  padding:13px 15px;display:flex;flex-direction:column;gap:7px}
+.card h4{margin:0;font:12px var(--mono);color:var(--ink);letter-spacing:.04em}
+.card .why{color:var(--dim);font-size:12px;margin:0}
+.card .proves{color:var(--faint);font-size:11px;margin:0;border-left:2px solid var(--line);
+  padding-left:9px}
+.card .proves b{color:var(--ok);font-weight:600}
+.card .cmd{font:10px var(--mono);color:var(--gold);background:var(--panel2);
+  border:1px solid var(--line);border-radius:6px;padding:6px 8px;overflow-x:auto;
+  white-space:nowrap;margin-top:auto}
+.pill{display:inline-block;font:9px var(--mono);letter-spacing:.1em;text-transform:uppercase;
+  padding:2px 7px;border-radius:99px;border:1px solid var(--line);color:var(--faint)}
+.pill.ok{color:var(--ok);border-color:rgba(61,220,151,.4)}
+.pill.warn{color:var(--warn);border-color:rgba(255,182,72,.45)}
+.pill.bad{color:var(--bad);border-color:rgba(255,92,92,.45)}
+.pill.live{color:var(--live);border-color:rgba(74,168,255,.45)}
+
+/* tables */
+table.t{width:100%;border-collapse:collapse;font:11px var(--mono)}
+table.t th{text-align:left;color:var(--faint);font-weight:400;text-transform:uppercase;
+  letter-spacing:.1em;font-size:9px;padding:5px 9px 5px 0;border-bottom:1px solid var(--line)}
+table.t td{padding:5px 9px 5px 0;border-bottom:1px solid rgba(42,52,68,.5);color:var(--dim)}
+table.t td.n{color:var(--ink)}
+table.t tr:last-child td{border-bottom:none}
+
+/* big stat */
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+.stat{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:11px 13px}
+.stat .v{font:23px var(--mono);font-weight:600;color:var(--ink)}
+.stat .k{font:9px var(--mono);color:var(--faint);text-transform:uppercase;
+  letter-spacing:.12em;margin-top:3px}
+.stat.good .v{color:var(--ok)} .stat.warn .v{color:var(--warn)}
+
+/* ---------- EEO verdict badge ---------- */
+.eeo{display:flex;gap:9px;align-items:baseline;flex-wrap:wrap;margin:-2px 0 2px}
+.eeo-badge{font:10px var(--mono);font-weight:600;letter-spacing:.12em;
+  padding:2px 8px;border-radius:5px;border:1px solid var(--line);white-space:nowrap}
+.eeo-badge.pass{color:var(--ok);border-color:rgba(61,220,151,.5);background:rgba(61,220,151,.12)}
+.eeo-badge.fail{color:var(--bad);border-color:rgba(255,92,92,.5);background:rgba(255,92,92,.12)}
+.eeo-badge.unknown{color:var(--faint)}
+.eeo-why{font:10px var(--mono);color:var(--dim)}
+
+/* ---------- controls ---------- */
+.controls{display:flex;gap:9px;align-items:center;flex-wrap:wrap;
+  background:var(--panel);border:1px solid var(--line);border-radius:10px;
+  padding:9px 12px;margin-bottom:12px}
+.controls .ctl-label{font:10px var(--mono);color:var(--faint);
+  text-transform:uppercase;letter-spacing:.14em}
+.controls select,.controls button{font:11px var(--mono);border-radius:7px;
+  border:1px solid var(--line);background:var(--panel2);color:var(--ink);padding:6px 10px}
+.controls select{cursor:pointer}
+.controls button{cursor:pointer;color:var(--live);border-color:rgba(74,168,255,.45);
+  font-weight:600;letter-spacing:.08em;padding:6px 18px}
+.controls button:hover:not(:disabled){background:rgba(74,168,255,.14)}
+.controls button:disabled{opacity:.5;cursor:not-allowed;color:var(--faint);
+  border-color:var(--line)}
+.controls .ctl-sep{width:1px;height:20px;background:var(--line)}
+.controls #runlive{color:var(--gold);border-color:rgba(255,215,110,.45)}
+.controls #runlive:hover:not(:disabled){background:rgba(255,215,110,.12)}
+.controls .ctl-note{font:10px var(--mono);color:var(--faint);margin-left:auto}
+.controls .ctl-note.warn{color:var(--warn)}
+.controls .ctl-note.busy{color:var(--live)}
+
+/* ---------- live distributed pane ---------- */
+.live-head{display:flex;gap:10px;align-items:baseline;margin-bottom:7px}
+.live-head .pill{flex:0 0 auto}
+.live-head #live-sub{font:10px var(--mono);color:var(--faint);line-height:1.55;max-width:110ch}
+.live-head #live-sub b{color:var(--gold);font-weight:600}
+.live-head #live-sub code{color:var(--dim)}
+#live-wrap{margin-bottom:14px}
+.pane.livepane{border-color:rgba(255,215,110,.4);
+  box-shadow:0 0 0 1px rgba(255,215,110,.1);min-height:0}
+
+/* ---------- architecture diagram ----------
+   Drawn in the page rather than embedded as an export, so it inherits the theme
+   instead of sitting on a white plate fighting it, and stays crisp at any zoom. */
+.arch{width:100%;max-width:660px;height:auto;display:block;margin:2px auto 6px}
+.arch .box{fill:var(--panel2);stroke:var(--line);stroke-width:1.2}
+.arch .box.accent-live{stroke:rgba(74,168,255,.6);fill:rgba(74,168,255,.08)}
+.arch .box.accent-gold{stroke:rgba(255,215,110,.6);fill:rgba(255,215,110,.08)}
+.arch .box.accent-bad{stroke:rgba(255,92,92,.6);fill:rgba(255,92,92,.08)}
+.arch .box.accent-ok{stroke:rgba(61,220,151,.45);fill:rgba(61,220,151,.06)}
+.arch .t{fill:var(--ink);font:600 13.5px ui-sans-serif,system-ui,"Segoe UI",sans-serif}
+.arch .s{fill:var(--faint);font:10px var(--mono)}
+.arch .el{fill:var(--dim);font:10px var(--mono)}
+.arch .edge{stroke:var(--faint);stroke-width:1.4;fill:none;marker-end:url(#ah)}
+.arch .edge.dash{stroke-dasharray:5 4;stroke:var(--ghost)}
+.arch marker path{fill:var(--faint)}
+.flow{font:11px var(--mono);color:var(--dim);line-height:1.9}
+.flow b{color:var(--live);font-weight:600}
+.rule{border-left:2px solid var(--gold);padding:2px 0 2px 11px;color:var(--dim);
+  font-size:12px;margin:9px 0 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>SLUICE</h1>
+    <span class="sub">divergence-safe durable execution &mdash; one crash, three outcomes</span>
+    <span class="tag" id="tag">connecting&hellip;</span>
+    <button id="theme" title="light / dark">◐</button>
+  </header>
+
+  <div class="tabs" role="tablist">
+    <button role="tab" aria-selected="true"  data-tab="live">Live</button>
+    <button role="tab" aria-selected="false" data-tab="arch">Architecture</button>
+    <button role="tab" aria-selected="false" data-tab="scen">Scenarios</button>
+    <button role="tab" aria-selected="false" data-tab="edge">Edge cases</button>
+    <button role="tab" aria-selected="false" data-tab="analysis">Analysis</button>
+    <button role="tab" aria-selected="false" data-tab="guide">Guide</button>
+    <span class="spacer">press 1&ndash;6</span>
+  </div>
+
+  <!-- ===================================================== LIVE ============ -->
+  <section id="tab-live">
+    <div class="controls" id="controls">
+      <span class="ctl-label">workload</span>
+      <select id="scenario"></select>
+      <select id="speed">
+        <option value="0.35" selected>slow &mdash; 0.35s/step</option>
+        <option value="0.15">medium &mdash; 0.15s/step</option>
+        <option value="0">fast &mdash; no pause</option>
+      </select>
+      <button id="runbtn">Run</button>
+      <span class="ctl-sep"></span>
+      <select id="livemode" title="mode for the distributed run">
+        <option value="sluice" selected>sluice</option>
+        <option value="pinned">pinned</option>
+        <option value="naive">naive</option>
+      </select>
+      <button id="runlive" title="producer &rarr; Redis &rarr; orchestrator &rarr; HTTP services">Run distributed</button>
+      <span class="ctl-note" id="ctlnote"></span>
+    </div>
+
+    <div class="topo" id="topo"></div>
+
+    <!-- The distributed run. Separate from the three panes because it is not a
+         competing strategy: it is the same strategy over real sockets and a real
+         Redis stream, written by sluice orchestrator to its own journal. -->
+    <div id="live-wrap" hidden>
+      <div class="live-head">
+        <span class="pill live">live &middot; distributed</span>
+        <span id="live-sub"><b>Not a fourth strategy.</b> This is sluice again &mdash;
+          but run for real by <code>sluice orchestrator</code> over a Redis stream, four
+          OS processes and real sockets, instead of in-process below. Same journal
+          format, different world. Hidden until there is a distributed run to show.</span>
+      </div>
+      <div id="live-pane"></div>
+    </div>
+
+    <div class="panes" id="panes"></div>
+
+    <div class="legend">
+      <span><b>step:</b> &#9633; pending &nbsp; &#9679; committed &nbsp; &#10005; failed
+        &nbsp; ? unknown &nbsp; <span style="color:var(--bad)">&#9632;</span> uncompensated
+        &nbsp; <span style="color:var(--ghost)">&#9633;</span> compensated</span>
+      <span><b>circle</b> = irreversible effect (page_oncall)</span>
+      <span><b>grey branch</b> = abandoned &mdash; still legible, which is the point</span>
+    </div>
+  </section>
+
+  <!-- ============================================= ARCHITECTURE ============ -->
+  <section id="tab-arch" hidden>
+    <div class="doc">
+      <h3>The topology</h3>
+      <p class="lede">Four OS processes, one container, one shared journal.
+        <b>Nothing trusts itself</b> &mdash; the thing that acts and the thing that
+        records ground truth are different processes.</p>
+      <svg class="arch" viewBox="0 0 900 636" role="img"
+           aria-label="Sluice architecture: producer, Redis stream, two orchestrators, shared SQLite WAL journal, three effect services, ground-truth ledger, EEO checker and the read-only dashboard">
+        <defs>
+          <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6"
+                  markerHeight="6" orient="auto-start-reverse">
+            <path d="M0,1 L9,5 L0,9 z"/>
+          </marker>
+        </defs>
+
+        <!-- edges first, so boxes sit on top of the line ends -->
+        <path class="edge" d="M480,64 L480,100"/>
+        <text class="el" x="490" y="86">synthetic alerts</text>
+
+        <path class="edge" d="M480,152 L480,192"/>
+        <text class="el" x="490" y="176">consumer group</text>
+        <path class="edge" d="M430,150 C340,175 240,175 168,192"/>
+        <text class="el" x="238" y="163" text-anchor="middle">consumer group</text>
+
+        <path class="edge" d="M420,250 C340,285 270,300 230,318"/>
+        <text class="el" x="330" y="300" text-anchor="middle">shared journal</text>
+        <path class="edge" d="M158,250 L178,318"/>
+
+        <path class="edge" d="M440,250 C425,280 415,295 410,318"/>
+        <path class="edge" d="M520,250 C540,280 552,295 558,318"/>
+        <path class="edge" d="M560,250 C640,275 700,295 726,318"/>
+        <text class="el" x="655" y="288" text-anchor="middle">HTTP + fencing epoch</text>
+
+        <path class="edge" d="M410,374 C420,405 430,425 448,440"/>
+        <path class="edge" d="M558,374 C545,405 530,425 512,440"/>
+        <path class="edge" d="M726,374 C700,410 640,432 592,444"/>
+
+        <path class="edge" d="M480,506 L480,552"/>
+        <text class="el" x="490" y="534">effects, as committed</text>
+
+        <path class="edge" d="M188,384 L172,440"/>
+        <text class="el" x="196" y="416">read-only</text>
+
+        <!-- The checker compares the journal against the ledger. Reading only the
+             ledger would tell you what happened but not what was intended. -->
+        <path class="edge dash" d="M252,378 C300,462 322,540 368,574"/>
+        <text class="el" x="316" y="512" text-anchor="middle">journal</text>
+
+        <!-- nodes -->
+        <rect class="box" x="390" y="16" width="180" height="48" rx="8"/>
+        <text class="t" x="480" y="40" text-anchor="middle">Alert Producer</text>
+        <text class="s" x="480" y="55" text-anchor="middle">sluice producer</text>
+
+        <rect class="box accent-live" x="390" y="104" width="180" height="48" rx="8"/>
+        <text class="t" x="480" y="128" text-anchor="middle">Redis Stream</text>
+        <text class="s" x="480" y="143" text-anchor="middle">alerts:incoming · 6379</text>
+
+        <rect class="box" x="48" y="192" width="240" height="58" rx="8"/>
+        <text class="t" x="168" y="217" text-anchor="middle">Orchestrator B</text>
+        <text class="s" x="168" y="233" text-anchor="middle">standby · refused while A leads</text>
+
+        <rect class="box accent-gold" x="360" y="192" width="240" height="58" rx="8"/>
+        <text class="t" x="480" y="217" text-anchor="middle">Orchestrator A</text>
+        <text class="s" x="480" y="233" text-anchor="middle">leader · holds the lease · epoch N</text>
+
+        <!-- SQLite WAL, as a datastore -->
+        <path class="box" d="M88,331 v44 a100,9 0 0 0 200,0 v-44 z"/>
+        <ellipse class="box" cx="188" cy="331" rx="100" ry="9"/>
+        <text class="t" x="188" y="356" text-anchor="middle">SQLite WAL</text>
+        <text class="s" x="188" y="371" text-anchor="middle">shared journal</text>
+
+        <rect class="box accent-ok" x="344" y="322" width="132" height="52" rx="8"/>
+        <text class="t" x="410" y="345" text-anchor="middle">Ticket</text>
+        <text class="s" x="410" y="361" text-anchor="middle">8101 · reversible</text>
+
+        <rect class="box accent-ok" x="492" y="322" width="132" height="52" rx="8"/>
+        <text class="t" x="558" y="345" text-anchor="middle">Channel</text>
+        <text class="s" x="558" y="361" text-anchor="middle">8102 · reversible</text>
+
+        <rect class="box accent-bad" x="640" y="322" width="180" height="52" rx="8"/>
+        <text class="t" x="730" y="345" text-anchor="middle">Pager</text>
+        <text class="s" x="730" y="361" text-anchor="middle">8103 · irreversible, unobservable</text>
+
+        <path class="box accent-live" d="M352,453 v44 a128,9 0 0 0 256,0 v-44 z"/>
+        <ellipse class="box accent-live" cx="480" cy="453" rx="128" ry="9"/>
+        <text class="t" x="480" y="478" text-anchor="middle">Ground-Truth Ledger</text>
+        <text class="s" x="480" y="493" text-anchor="middle">8100 · the oracle, a separate process</text>
+
+        <rect class="box accent-live" x="368" y="552" width="224" height="52" rx="8"/>
+        <text class="t" x="480" y="575" text-anchor="middle">EEO Checker</text>
+        <text class="s" x="480" y="591" text-anchor="middle">journal vs ledger</text>
+
+        <rect class="box" x="68" y="440" width="200" height="52" rx="8"/>
+        <text class="t" x="168" y="463" text-anchor="middle">Dashboard</text>
+        <text class="s" x="168" y="479" text-anchor="middle">8000 · never drives</text>
+      </svg>
+      <p class="rule">Drawn live in the page, so it themes with everything else.
+        <b style="color:var(--gold)">Gold</b> is whoever holds the lease,
+        <b style="color:var(--bad)">red</b> is the one effect that cannot be undone or
+        queried, <b style="color:var(--live)">blue</b> is the verification path.
+        The dashed line is the addition worth noticing: the checker reads the
+        <b>journal as well as the ledger</b> &mdash; the ledger alone tells you what
+        happened, not what was intended, and EEO is a claim about both.</p>
+    </div>
+
+    <div class="grid2">
+      <div class="doc">
+        <h3>Following one alert</h3>
+        <p class="flow">
+          <b>1.</b> <code>sluice producer</code> publishes to a Redis stream.<br>
+          <b>2.</b> A <b>consumer group</b> hands it to whichever orchestrator asks.
+            Delivery is <b>at-least-once</b> &mdash; duplicates are expected, not a bug.<br>
+          <b>3.</b> The orchestrator derives <code>workflow_id</code> from the alert id,
+            so a redelivered alert lands on the <b>same</b> workflow.<br>
+          <b>4.</b> It takes a <b>lease</b> on that workflow. The loser does not act, and
+            does not ack &mdash; the entry stays pending for whoever leads.<br>
+          <b>5.</b> Every step is journaled to a shared <b>SQLite WAL</b> file before and
+            after it runs. That record is what makes a crash resumable.<br>
+          <b>6.</b> Effects go over <b>HTTP</b> to three services, each carrying an
+            idempotency key and a <b>fencing epoch</b>.<br>
+          <b>7.</b> Each service writes what it did to the <b>ground-truth ledger</b>,
+            a fourth process.<br>
+          <b>8.</b> The <b>EEO checker</b> compares journal against ledger. It is the
+            oracle, and it is not the orchestrator.
+        </p>
+      </div>
+
+      <div class="doc">
+        <h3>Ports</h3>
+        <table class="t">
+          <tr><th>Port</th><th>Process</th><th>Role</th></tr>
+          <tr><td class="n">8000</td><td>dashboard</td><td>this page &mdash; read-only</td></tr>
+          <tr><td class="n">8100</td><td>ledger</td><td>ground truth, the oracle</td></tr>
+          <tr><td class="n">8101</td><td>ticket</td><td>reversible effect</td></tr>
+          <tr><td class="n">8102</td><td>channel</td><td>reversible effect</td></tr>
+          <tr><td class="n">8103</td><td>pager</td><td><b>irreversible + unobservable</b></td></tr>
+          <tr><td class="n">6379</td><td>redis</td><td>alert stream (Docker, in WSL2)</td></tr>
+        </table>
+        <p class="rule"><b>The dashboard reads journals and never drives execution.</b>
+          If this page dies, the system keeps running and the demo continues from the
+          terminal. It opens every journal read-only.</p>
+      </div>
+    </div>
+
+    <div class="doc">
+      <h3>Why the pager is the hard one</h3>
+      <p>The three effect services are deliberately not equivalent. A ticket can be
+        closed and a channel post can be deleted, so both are <b>reversible</b> &mdash; a
+        mistake is recoverable. Both can also be queried, so they are
+        <b>observable</b> &mdash; after a timeout you can go and find out what happened.</p>
+      <p>Paging a human is neither. You cannot un-ring a phone, and the pager exposes no
+        endpoint to ask whether it rang. When a page times out there is no inverse to
+        apply and nothing to probe, which is exactly why the system treats
+        <code>unknown</code> as its own outcome rather than collapsing it into
+        <code>failed</code>. See <b>Edge cases &rarr; Bounded ambiguity</b>.</p>
+    </div>
+  </section>
+
+  <!-- ================================================= SCENARIOS =========== -->
+  <section id="tab-scen" hidden>
+    <div class="doc">
+      <h3>Seven scenarios</h3>
+      <p>Each runs against all three modes:
+        <span class="pill bad">pinned</span> replays the journaled decision,
+        <span class="pill warn">naive</span> re-runs the agent,
+        <span class="pill ok">sluice</span> forks, cleans up, then acts.</p>
+      <p>The baselines aren't strawmen &mdash; they're what a reasonable engineer builds,
+        and each fails a different EEO clause. Pick one from the dropdown on the Live
+        tab, or run <code>sluice demo --scenario NAME --slow 0.35</code>.</p>
+    </div>
+    <div class="grid2" id="scenarios"></div>
+  </section>
+
+  <!-- ================================================= EDGE CASES ========== -->
+  <section id="tab-edge" hidden>
+    <div class="doc">
+      <h3>The corners that actually decide correctness</h3>
+      <p>Each is covered by a test or smoke check, not just by argument. The
+        interesting ones are where the honest answer is <i>"I don't know"</i> &mdash;
+        guessing there is worse than escalating.</p>
+    </div>
+    <div class="grid2" id="edges"></div>
+  </section>
+
+  <!-- ================================================== ANALYSIS =========== -->
+  <section id="tab-analysis" hidden>
+    <div class="doc">
+      <h3>Exactly-Effect-Once &mdash; the three clauses</h3>
+      <p>A claim about <b>effects</b>, checked against the out-of-process ledger.
+        A safety property, not a liveness one.</p>
+      <div class="grid3">
+        <div class="card"><h4>1 &middot; No duplication</h4>
+          <p class="why">No irreversible effect is applied twice for one incident without
+            a supersede annotation explaining the second.</p></div>
+        <div class="card"><h4>2 &middot; No loss</h4>
+          <p class="why">Every workflow ends with either a committed action or an
+            escalation a human can see. Silence is a violation.</p></div>
+        <div class="card"><h4>3 &middot; Clean abandonment</h4>
+          <p class="why">An abandoned branch leaves no uncompensated reversible effect,
+            and any irreversible residue is recorded and superseded.</p></div>
+      </div>
+      <p class="rule">Refusing to act against a broken world and saying so is
+        <b>not</b> a violation &mdash; it did no work. Hence the escalation rate beside
+        the verdict: a verdict alone goes green against a dead effect layer.</p>
+    </div>
+
+    <div class="doc">
+      <h3>Crash sweep &mdash; <code>sluice demo --sweep-quick</code></h3>
+      <div class="stats">
+        <div class="stat"><div class="v">51</div><div class="k">total runs</div></div>
+        <div class="stat"><div class="v">17</div><div class="k">crash points</div></div>
+        <div class="stat"><div class="v">3</div><div class="k">fault modes</div></div>
+        <div class="stat good"><div class="v">51/51</div><div class="k">clause 1 &middot; no dup</div></div>
+        <div class="stat good"><div class="v">51/51</div><div class="k">clause 2 &middot; no loss</div></div>
+        <div class="stat good"><div class="v">51/51</div><div class="k">clause 3 &middot; clean abd</div></div>
+        <div class="stat warn"><div class="v">33.3%</div><div class="k">escalation rate</div></div>
+        <div class="stat good"><div class="v">0</div><div class="k">unexplained violations</div></div>
+      </div>
+      <p class="rule">Every step boundary × every branch state × three fault modes.
+        <b>0 unexplained violations</b> is the number that matters. The escalation rate
+        is the automation-vs-human tradeoff, measured rather than claimed.</p>
+    </div>
+
+    <div class="grid2">
+      <div class="doc">
+        <h3>By fault mode</h3>
+        <table class="t">
+          <tr><th>Mode</th><th>Runs</th><th>Acted</th><th>Escalated</th><th>Rate</th><th>Unexpl</th></tr>
+          <tr><td>crash</td><td class="n">17</td><td class="n">17</td><td class="n">0</td><td>0.0%</td><td class="n">0</td></tr>
+          <tr><td>partition</td><td class="n">17</td><td class="n">0</td><td class="n">17</td><td>100.0%</td><td class="n">0</td></tr>
+          <tr><td>partition-transient</td><td class="n">17</td><td class="n">17</td><td class="n">0</td><td>0.0%</td><td class="n">0</td></tr>
+        </table>
+        <p class="rule">A durable partition escalates <b>every time</b>; a transient one
+          recovers every time. Neither ever duplicates.</p>
+      </div>
+
+      <div class="doc">
+        <h3>The poison step, three ways</h3>
+        <table class="t">
+          <tr><th>Mode</th><th>Tickets</th><th>Posts</th><th>Pages</th><th>Verdict</th></tr>
+          <tr><td><span class="pill bad">pinned</span></td><td class="n">1</td><td class="n">1</td><td class="n">0</td>
+              <td>FAIL &mdash; no_loss</td></tr>
+          <tr><td><span class="pill warn">naive</span></td><td class="n">2</td><td class="n">2</td><td class="n">1</td>
+              <td>FAIL &mdash; clean_abandonment</td></tr>
+          <tr><td><span class="pill ok">sluice</span></td><td class="n">1</td><td class="n">1</td><td class="n">1</td>
+              <td><b style="color:var(--ok)">PASS</b></td></tr>
+        </table>
+        <p class="rule"><b>pinned</b> pages nobody. <b>naive</b> reaches a human but
+          leaves two uncompensated effects. Only the third acts once and cleans up.</p>
+      </div>
+    </div>
+
+    <div class="doc">
+      <h3>What is verified, and by what</h3>
+      <div class="grid3">
+        <div class="stat"><div class="v">351</div><div class="k">pytest &mdash; unit + integration, real processes + Redis</div></div>
+        <div class="stat"><div class="v">20</div><div class="k">smoke &mdash; checks of a running topology</div></div>
+        <div class="stat"><div class="v">51</div><div class="k">quick-sweep runs &mdash; against the ledger</div></div>
+      </div>
+      <p class="rule">Not equivalent. The sweep is graded by the oracle &mdash; the
+        ground-truth ledger, not the system's own view &mdash; so it is the evidence.
+        <code>pytest</code> pins each module and crosses real boundaries (service processes,
+        Redis, a <code>kill -9</code> failover); <code>sluice smoke</code> checks a live
+        topology. Reproduce it all with <code>scripts/verify.sh</code>.</p>
+    </div>
+  </section>
+
+  <!-- ===================================================== GUIDE =========== -->
+  <section id="tab-guide" hidden>
+    <div class="doc">
+      <h3>Reading the Live tab</h3>
+      <p class="lede">Every element, top to bottom. The one that decides whether a run
+        was <b>correct</b> is the EEO badge &mdash; everything else describes what
+        happened, not whether it was right.</p>
+    </div>
+
+    <div class="doc">
+      <h3>The EEO badge &mdash; read this one first</h3>
+      <table class="t">
+        <tr><th>Badge</th><th>Means</th></tr>
+        <tr><td><span class="eeo-badge pass">EEO PASS</span></td>
+            <td>No effect duplicated, nothing lost, no uncompensated residue on an
+                abandoned branch. <b>Graded against the ledger, a different process.</b></td></tr>
+        <tr><td><span class="eeo-badge fail">EEO FAIL</span></td>
+            <td>At least one unexplained clause violation. The clause names appear
+                beside the badge.</td></tr>
+        <tr><td><span class="eeo-badge unknown">EEO &mdash;</span></td>
+            <td>No verdict on file yet. The grader writes one beside the journal when
+                a run finishes; a journal alone cannot be graded.</td></tr>
+      </table>
+      <p class="rule"><b>A pane can escalate and still PASS.</b> That is not a
+        contradiction: EEO is a safety property. A workflow that refuses to act against
+        a broken world and hands a human the details has duplicated nothing and lost
+        nothing. <code>compfail</code> is exactly this case &mdash; sluice escalates,
+        pages nobody, and passes, while <code>naive</code> pages someone and fails.</p>
+    </div>
+
+    <div class="grid2">
+      <div class="doc">
+        <h3>Steps and branches</h3>
+        <table class="t">
+          <tr><th>Element</th><th>Means</th></tr>
+          <tr><td>square chip</td><td>one of the 8 workflow steps, numbered left to right</td></tr>
+          <tr><td><b>circle</b> chip</td><td>the irreversible effect &mdash; <code>page_oncall</code></td></tr>
+          <tr><td>green fill</td><td>committed</td></tr>
+          <tr><td>red &times;</td><td>failed</td></tr>
+          <tr><td>?</td><td>unknown &mdash; may or may not have happened</td></tr>
+          <tr><td>red filled square</td><td><b>uncompensated</b> on an abandoned branch</td></tr>
+          <tr><td>hollow / grey</td><td>compensated</td></tr>
+          <tr><td>dashed &ndash;</td>
+              <td><b>never reached.</b> The workflow stopped before this step. Not the
+                  same as pending: nothing is coming. <code>zombie</code> ends this way
+                  &mdash; it escalates at step 7 rather than updating the status page to
+                  claim an incident nobody was provably paged about is handled.</td></tr>
+          <tr><td><span class="pill">ACTIVE</span></td><td>the branch currently executing</td></tr>
+          <tr><td><span class="pill">ABANDONED</span></td><td>forked away from; kept visible on purpose</td></tr>
+          <tr><td><span class="pill ok">COMPENSATED</span></td><td>abandoned and cleaned up</td></tr>
+          <tr><td>depth 0 / depth 1</td><td>how many times the workflow diverged</td></tr>
+          <tr><td>P2 &rarr; rota-X</td><td>the classification this branch made, and where it routed</td></tr>
+        </table>
+        <p class="rule">Abandoned branches stay on screen. A system that hides its
+          wrong turns cannot be audited &mdash; the grey branch <i>is</i> the evidence.</p>
+      </div>
+
+      <div class="doc">
+        <h3>The gate (barrier)</h3>
+        <table class="t">
+          <tr><th>State</th><th>Means</th></tr>
+          <tr><td>gate open</td><td>no irreversible effect pending</td></tr>
+          <tr><td><b style="color:var(--bad)">gate holding</b></td>
+              <td>an irreversible effect is <b>blocked</b> until the abandoned branch is
+                  cleaned up. The count on the right is how many effects remain.</td></tr>
+          <tr><td><b style="color:var(--ok)">gate lifted</b></td>
+              <td>cleanup proven; the page was allowed through</td></tr>
+          <tr><td><b style="color:var(--warn)">gate escalated</b></td>
+              <td><b>terminal.</b> Compensation was retried to a deadline and failed, so
+                  a human was given the branch tree and the uncompensated list. It is
+                  not still waiting &mdash; it is finished.</td></tr>
+        </table>
+        <p class="rule">The gate never blocks on irreversible <i>residue</i> &mdash;
+          blocking on something that can never be satisfied is a deadlock by
+          construction. It blocks only on what can actually be compensated.</p>
+      </div>
+    </div>
+
+    <div class="grid2">
+      <div class="doc">
+        <h3>Timer and phones</h3>
+        <table class="t">
+          <tr><th>Element</th><th>Means</th></tr>
+          <tr><td><b style="color:var(--bad)">red, climbing</b></td>
+              <td>the workflow has <b>not</b> terminated and nobody has been paged.
+                  This is the incident clock, and it is meant to be uncomfortable.</td></tr>
+          <tr><td><b style="color:var(--ok)">green, frozen</b></td>
+              <td>terminal. The number is the run's real duration &mdash; <b>frozen, not
+                  stuck</b>. It reads <code>0m 00s</code> when the run was sub-second, which
+                  is normal in-process; use the slow speed to see real time.</td></tr>
+          <tr><td>dark phone</td><td>nobody was paged</td></tr>
+          <tr><td><b style="color:var(--ok)">green phone</b></td><td>paged once &mdash; correct</td></tr>
+          <tr><td><b style="color:var(--bad)">red phone</b></td>
+              <td>the <b>double buzz</b>: a second page with no supersede annotation.
+                  Someone's phone rang twice and the second ring explained nothing.</td></tr>
+          <tr><td><b style="color:var(--warn)">amber phone</b></td>
+              <td>a second page that <i>does</i> carry a supersede annotation naming
+                  the page it replaces. Honest, not silent.</td></tr>
+        </table>
+      </div>
+
+      <div class="doc">
+        <h3>Scoreboard, topology, events</h3>
+        <table class="t">
+          <tr><th>Element</th><th>Means</th></tr>
+          <tr><td>tickets / posts / pages</td>
+              <td><b>net</b> counts from the ledger &mdash; effects that stand after
+                  compensation. The target is <b>1 / 1 / 1</b>.</td></tr>
+          <tr><td>gross a/b/c</td>
+              <td>everything ever issued, before compensation. <code>gross 2/2/1</code>
+                  with net <code>1/1/1</code> is the system working: it acted twice and
+                  undid one.</td></tr>
+          <tr><td>topology strip</td>
+              <td>the effect services and the current leader's <b>epoch</b> &mdash; the
+                  fencing token services use to refuse a deposed leader.</td></tr>
+          <tr><td>event log</td>
+              <td>journal records, newest first. <code>BARRIER_BLOCKED</code>,
+                  <code>BRANCH_FORKED</code>, <code>COMP_RESULT</code>,
+                  <code>ESCALATED</code> are the ones worth narrating.</td></tr>
+          <tr><td><span class="pill live">live &middot; distributed</span></td>
+              <td>the gold pane: a real run from <code>sluice orchestrator</code> over
+                  Redis and HTTP, not the in-process demo. Appears only when that
+                  journal has something in it.</td></tr>
+        </table>
+      </div>
+    </div>
+
+    <div class="doc">
+      <h3>Driving it</h3>
+      <p>Pick a workload from the dropdown and press <b>Run</b> &mdash; it executes all
+        three modes in order and the panes fill in live. The button needs
+        <code>sluice dashboard --allow-control</code>; without it the button is
+        disabled and you drive from a terminal instead:</p>
+      <p><code>sluice demo --scenario poison --slow 0.35</code></p>
+      <p>For the distributed pane, with services and Redis up:</p>
+      <p><code>sluice faults poison</code>, then
+         <code>sluice producer --demo --count 1</code>, then
+         <code>sluice orchestrator --once --narrate</code></p>
+      <p class="rule">The dashboard reads journals and never drives execution. Even the
+        Run button launches the same scenario code a terminal would &mdash; if this page
+        dies mid-demo, the system is unaffected.</p>
+    </div>
+  </section>
+</div>
+
+<div class="board"><div class="inner" id="board"></div></div>
+
+<script>
+/* ---------------------------------------------------------------- tabs ---- */
+const TABS = ["live","arch","scen","edge","analysis","guide"];
+function showTab(name){
+  TABS.forEach(t=>{
+    const sec = document.getElementById("tab-"+t);
+    if(sec) sec.hidden = (t!==name);
+  });
+  document.querySelectorAll(".tabs button").forEach(b=>
+    b.setAttribute("aria-selected", String(b.dataset.tab===name)));
+  // The scoreboard is a live readout; it would be lying on a static tab.
+  document.querySelector(".board").style.display = (name==="live") ? "" : "none";
+  location.hash = name;
+}
+document.querySelectorAll(".tabs button").forEach(b=>
+  b.addEventListener("click",()=>showTab(b.dataset.tab)));
+document.addEventListener("keydown",e=>{
+  if(e.target.tagName==="INPUT"||e.metaKey||e.ctrlKey||e.altKey) return;
+  const i = "123456".indexOf(e.key);
+  if(i>=0) showTab(TABS[i]);
+});
+
+/* ------------------------------------------------------- scenario cards ---- */
+/* Descriptions track the docstrings in sluice/scenarios/catalog.py. */
+const SCENARIOS = [
+  {name:"poison", tag:"GATE 2", pill:"live",
+   why:"Classified P2, routed to rota X. Nobody is on call there, so step 7 fails.",
+   proves:"<b>1/1/1</b> — fork, clean up the dead branch, page rota Y once.",
+   cmd:"sluice demo --scenario poison"},
+
+  {name:"residue", tag:"the hard version", pill:"warn",
+   why:"The page to rota X succeeds, and only then is the misclassification found.",
+   proves:"You cannot un-ring a phone. The second page <b>supersedes</b> the first, in writing.",
+   cmd:"sluice demo --scenario residue"},
+
+  {name:"compfail", tag:"the sharpest objection", pill:"bad",
+   why:"Poison step, but the ticket service dies during cleanup. Retries exhaust.",
+   proves:"Neither proceeds nor hangs: <b>escalates</b> with the uncompensated list. Pages nobody, and still passes EEO.",
+   cmd:"sluice demo --scenario compfail"},
+
+  {name:"compretry", tag:"the other half", pill:"ok",
+   why:"The same outage, but transient — the service returns before the budget is spent.",
+   proves:"Drain completes, gate lifts, page fires. The bound makes retrying <b>safe</b>, not pointless.",
+   cmd:"sluice demo --scenario compretry"},
+
+  {name:"zombie", tag:"late delivery", pill:"warn",
+   why:"The page times out. Irreversible and unobservable: no inverse, nothing to probe. It lands later anyway.",
+   proves:"Escalates as <b>bounded ambiguity</b>, stops before step 8. The late page is caught on the key — one ring.",
+   cmd:"sluice demo --scenario zombie"},
+
+  {name:"crash", tag:"4 boundaries", pill:"live",
+   why:"Crash at a step boundary. Worst case <code>after_effect</code>: committed, nothing journaled.",
+   proves:"Re-drives under the <b>same key</b> and observes the commit instead of repeating it.",
+   cmd:"sluice demo --scenario crash --crash-phase after_effect"},
+
+  {name:"redelivery", tag:"at-least-once", pill:"ok",
+   why:"The stream delivers the same alert twice. Normal Redis behaviour, not a fault.",
+   proves:"Absorbed by <b>workflow_id derivation</b> + journal lookup. Not the step-4 marker — different problem.",
+   cmd:"sluice demo --scenario redelivery"}
+];
+
+/* ------------------------------------------------------ edge case cards ---- */
+const EDGES = [
+  {h:"Unknown is not failed", pill:"live",
+   why:"Slow and crashed look identical from outside. The request may well have committed.",
+   proves:"Yields <b>unknown</b>. The workflow escalates rather than guessing.",
+   cmd:"sluice smoke — real read timeout yields 'unknown'"},
+
+  {h:"Failed is not unknown", pill:"live",
+   why:"A refused connection never left the machine, so nothing committed.",
+   proves:"<b>failed</b>, definitively. Calling a closed port ambiguous invents escalations.",
+   cmd:"sluice smoke — refused connection is 'failed', not 'unknown'"},
+
+  {h:"Bounded ambiguity", pill:"warn",
+   why:"Irreversible and unobservable: no inverse to apply, no endpoint to ask.",
+   proves:"Status unknowable, signal <b>not lost</b> — a human gets it. That is what bounds the ambiguity.",
+   cmd:"pytest — test_unknown_page_that_never_lands_stays_surfaced"},
+
+  {h:"Stale epoch fenced", pill:"bad",
+   why:"A deposed leader waking from a pause still believes it leads.",
+   proves:"Services refuse a lower epoch with <b>HTTP 409</b>. Enforced there, not by the caller's manners.",
+   cmd:"sluice smoke — stale epoch fenced by the service"},
+
+  {h:"Crash at any boundary", pill:"live",
+   why:"Four boundaries. The nasty one is after_effect: committed, nothing journaled.",
+   proves:"<b>No boundary duplicates.</b> 17 points × 3 fault modes = 51 runs, all clean.",
+   cmd:"pytest — test_crash_at_a_boundary_never_duplicates_an_effect"},
+
+  {h:"Redelivered alert", pill:"ok",
+   why:"At-least-once by design: the same alert arrives two or three times.",
+   proves:"All land on <b>one workflow</b>; ledger counts do not move.",
+   cmd:"pytest — test_redelivered_alert_lands_on_one_workflow"},
+
+  {h:"Zombie effect lands late", pill:"warn",
+   why:"The page timed out, escalated, then completed anyway after the workflow moved on.",
+   proves:"Caught on the key and suppressed. <b>The phone rings once.</b>",
+   cmd:"pytest — test_zombie_page_is_caught_on_the_key_not_paged_twice"},
+
+  {h:"Barrier scope: aunt, not just sibling", pill:"live",
+   why:"A naive barrier checks only the branch it forked from. Trees are deeper than that.",
+   proves:"Catches an <b>aunt</b>, not just a sibling. A shallower check leaks residue.",
+   cmd:"pytest — test_barrier_scope_catches_an_aunt_not_just_a_sibling"},
+
+  {h:"Compensation order", pill:"ok",
+   why:"Undoing a ticket before the post referencing it leaves a dangling reference.",
+   proves:"Compensation unwinds in <b>reverse order</b>, like a stack.",
+   cmd:"pytest — test_compensation_runs_in_reverse_execution_order"},
+
+  {h:"Fork bound", pill:"warn",
+   why:"If every failure justifies another fork, the workflow diverges forever and never acts.",
+   proves:"Forking is <b>bounded</b>; on exhaustion it escalates instead of livelocking.",
+   cmd:"pytest — test_fork_bound_escalates_instead_of_livelocking"},
+
+  {h:"Concurrent lease acquisition", pill:"bad",
+   why:"Two orchestrators racing must not both believe they lead.",
+   proves:"Never issues a <b>duplicate epoch</b>. A fencing token means nothing if it repeats.",
+   cmd:"pytest — test_concurrent_lease_acquisition_never_issues_a_duplicate_epoch"},
+
+  {h:"Key stable across epochs", pill:"live",
+   why:"A key that changed with leadership would duplicate every effect on failover.",
+   proves:"Derived from workflow+branch+step, so <b>stable across epochs</b>.",
+   cmd:"pytest — test_key_is_stable_across_epochs"}
+];
+
+function renderStatic(){
+  const s = document.getElementById("scenarios");
+  SCENARIOS.forEach(x=>{
+    const c = el("div","card");
+    c.innerHTML = `<h4>${x.name} <span class="pill ${x.pill}">${x.tag}</span></h4>
+      <p class="why">${x.why}</p><p class="proves">${x.proves}</p>
+      <div class="cmd">${x.cmd}</div>`;
+    s.appendChild(c);
+  });
+  const e = document.getElementById("edges");
+  EDGES.forEach(x=>{
+    const c = el("div","card");
+    c.innerHTML = `<h4>${x.h} <span class="pill ${x.pill}">covered</span></h4>
+      <p class="why">${x.why}</p><p class="proves">${x.proves}</p>
+      <div class="cmd">${x.cmd}</div>`;
+    e.appendChild(c);
+  });
+}
+
+const STEPS = ["fetch_alerts","fetch_service_context","classify","write_dedupe_marker",
+               "create_ticket","post_to_channel","page_oncall","update_status_page"];
+const PANE_BLURB = {
+  pinned:"replay the journaled decision",
+  naive:"re-run the agent fresh",
+  sluice:"fork, clean up, then act"
+};
+const el = (t,c,x)=>{const n=document.createElement(t); if(c)n.className=c;
+  if(x!==undefined)n.textContent=x; return n;};
+const fmt = s => { s=Math.max(0,s); const m=Math.floor(s/60);
+  return m+"m "+String(Math.floor(s%60)).padStart(2,"0")+"s"; };
+
+function verdictLine(st){
+  const b=st.scoreboard, pages=b.pages;
+  if(st.escalations.length && !pages)
+    return ['v-dup','escalated to a human &mdash; degraded, but the signal is not lost'];
+  if(!pages && st.running)   return ['v-lost','livelocked &mdash; nobody paged'];
+  if(!pages)                 return ['v-lost','terminated with nobody paged'];
+  const unexplained = st.phones.filter((p,i)=>i>0 && !p.supersedes).length;
+  if(unexplained)            return ['v-dup','duplicate page &mdash; no supersede annotation'];
+  if(b.tickets>1||b.posts>1) return ['v-dup','duplicate effects left standing'];
+  if(st.residue.length)      return ['v-good','superseded, residue recorded'];
+  return ['v-good','cleaned up, paged once'];
+}
+
+function stepClass(pane, br, st){
+  let c = "step " + st.status;
+  if(st.irreversible) c += " irr";
+  // A pending step on a workflow that has STOPPED was never reached -- it is not
+  // in flight and nothing is coming.  Rendering the two identically makes a
+  // deliberate halt (zombie escalates at step 7 rather than claiming on the status
+  // page that an incident nobody was paged about is handled) look like a hang.
+  if(st.status==="pending" && !pane.running) c += " notreached";
+  // A committed compensatable effect stranded on a dead branch is the thing the
+  // gate is counting.  Bright red and pulsing until the drain reaches it (6.1).
+  if(br.dead && st.compensatable && st.status==="ok"){
+    const pending = pane.uncompensated.some(u=>u.branch_id===br.branch_id && u.seq===st.seq);
+    if(pending) c += " uncomp";
+  }
+  return c;
+}
+
+function renderBranch(pane, br){
+  const cls = "branch" + (br.dead?" dead":"") +
+              (br.status==="abandoned_with_residue"?" residue":"");
+  const wrap = el("div", cls);
+  const head = el("div","branch-head");
+  head.appendChild(el("span","badge "+br.status, br.status.replace(/_/g," ")));
+  head.appendChild(el("span",null,"depth "+br.depth));
+  head.appendChild(el("span",null,(br.severity||"--")+" → "+(br.rota||"--")));
+  wrap.appendChild(head);
+
+  const row = el("div","steps");
+  br.steps.forEach((st,i)=>{
+    const halted = st.status==="pending" && !pane.running;
+    const n = el("div", stepClass(pane,br,st), st.status==="ok"?"●":
+      st.status==="failed"?"✕":st.status==="unknown"?"?":halted?"–":String(i+1));
+    n.title = STEPS[st.seq]+" — "+(halted?"never reached; the workflow stopped before here"
+                                          :st.status)+(st.error?" ("+st.error+")":"");
+    row.appendChild(n);
+  });
+  wrap.appendChild(row);
+  return wrap;
+}
+
+function renderGate(pane){
+  const g = pane.barrier;
+  const box = el("div","gate "+g.state);
+  const bars = el("div","bars");
+  for(let i=0;i<4;i++) bars.appendChild(el("div","bar"));
+  box.appendChild(bars);
+
+  const txt = el("div","txt");
+  const names = {idle:"gate open", blocked:"gate holding",
+                 released:"gate lifted", escalated:"gate escalated — terminal"};
+  txt.appendChild(el("div","st", names[g.state]||g.state));
+  // The label text comes from the BARRIER_BLOCKED record's detail field.  A gate
+  // that closes without a reason is decoration.
+  txt.appendChild(el("div",null,g.label));
+  if(g.effects.length){
+    // "waiting on" is only true while the gate is still holding.  Once the workflow
+    // has escalated it is finished and waiting on nothing -- present tense there
+    // reads as a hang, which is exactly the wrong impression for a correct outcome.
+    txt.appendChild(el("div",null, g.state==="escalated"
+      ? "handed to a human, still uncompensated: "+g.effects.join(", ")
+      : "waiting on: "+g.effects.join(", ")));
+  }
+  box.appendChild(txt);
+  box.appendChild(el("div","cnt", String(g.count)));
+  return box;
+}
+
+function renderPhones(pane){
+  const row = el("div","phones");
+  const board = pane.scoreboard;
+
+  const t = el("div","timer "+(pane.running&&!board.pages?"burning":board.pages?"done":""));
+  t.appendChild(document.createTextNode(fmt(pane.elapsed_s)));
+  t.appendChild(el("small", board.pages?("paged ×"+board.pages):"nobody paged"));
+  row.appendChild(t);
+
+  if(!pane.phones.length){
+    const p = el("div","phone","dark");
+    p.title = "no page committed";
+    row.appendChild(p);
+  } else {
+    pane.phones.forEach((ph,i)=>{
+      const dupe = i>0 && !ph.supersedes;
+      const sup  = i>0 && ph.supersedes;
+      const p = el("div","phone "+(dupe?"dupe":sup?"superseded":"rang"), ph.rota||"?");
+      p.title = sup ? ph.supersedes.note : (ph.rota+" paged");
+      row.appendChild(p);
+    });
+  }
+
+  const note = el("div","phone-note");
+  pane.phones.forEach((ph,i)=>{
+    const d = el("div",null,(i+1)+". "+ph.rota+" paged");
+    if(i>0 && !ph.supersedes){ d.className="em"; d.textContent += "  ← no context"; }
+    if(i>0 &&  ph.supersedes) d.textContent += "  (supersedes "+ph.supersedes.rota+")";
+    note.appendChild(d);
+  });
+  pane.late_deliveries.forEach(ld=>
+    note.appendChild(el("div",null,"zombie "+ld.tool+" caught on the key")));
+  row.appendChild(note);
+  return row;
+}
+
+/* The EEO verdict is the only thing on this page that says whether the run was
+   CORRECT, as opposed to merely describing what happened.  Without it a pane that
+   escalated by design (compfail) looks worse than one that silently duplicated
+   effects (naive) -- exactly backwards.  It is graded against the out-of-process
+   ledger by whoever ran the workflow and read here from the sidecar. */
+function renderEEO(pane){
+  const w = pane.verdict;
+  const row = el("div","eeo");
+  if(!w){
+    row.appendChild(el("span","eeo-badge unknown","EEO —"));
+    row.appendChild(el("span","eeo-why","no verdict on file; the grader writes one"
+      + " beside the journal when a run finishes"));
+    return row;
+  }
+  row.appendChild(el("span","eeo-badge "+(w.pass?"pass":"fail"),
+                     w.pass?"EEO PASS":"EEO FAIL"));
+  const why = w.pass
+    ? (w.outcome==="escalated"
+        ? "escalated by design — no effect duplicated, nothing lost"
+        : "acted once, cleanup proven")
+    : (w.unexplained||[]).map(v=>v.clause).join(", ");
+  row.appendChild(el("span","eeo-why", why));
+  return row;
+}
+
+function renderPane(mode, pane, opts){
+  opts = opts || {};
+  const box = el("div","pane"+(mode==="sluice"&&!opts.live?" hero":"")
+                            +(opts.live?" livepane":""));
+  const h = el("div");
+  h.appendChild(el("h2",null, opts.title || mode));
+  h.appendChild(el("div","verdict", opts.blurb || PANE_BLURB[mode] || ""));
+  box.appendChild(h);
+
+  if(pane.missing || pane.empty){
+    box.appendChild(el("div","missing", pane.missing
+      ? (opts.live ? "no distributed run yet — start the orchestrator" : "no journal yet — run the demo")
+      : "journal empty"));
+    return box;
+  }
+
+  const [vc,vt] = verdictLine(pane);
+  const v = el("div","verdict "+vc); v.innerHTML = "<b>"+vt+"</b>";
+  box.appendChild(v);
+  box.appendChild(renderEEO(pane));
+
+  pane.branches.forEach(br=>box.appendChild(renderBranch(pane,br)));
+  if(mode==="sluice" || pane.barrier.state!=="idle") box.appendChild(renderGate(pane));
+  box.appendChild(renderPhones(pane));
+
+  const ev = el("div","events");
+  pane.events.slice(-14).reverse().forEach(e=>{
+    const d = (e.detail&&(e.detail.reason||e.detail.status||e.detail.note))||e.tool||"";
+    ev.appendChild(el("div","ev-"+e.kind, e.kind+"  "+d));
+  });
+  box.appendChild(ev);
+  return box;
+}
+
+function renderTopo(data){
+  const t = document.getElementById("topo");
+  t.innerHTML="";
+  const pal = data.panes.sluice||{};
+  t.appendChild(el("span","label","topology"));
+  t.appendChild(el("span","node up","alert source"));
+  t.appendChild(el("span","arrow","→"));
+  const lease = pal.lease;
+  t.appendChild(el("span","node leader",
+    "orchestrator "+(lease?lease.owner:"?")+" · epoch "+(lease?lease.epoch:"-")));
+  t.appendChild(el("span","arrow","→"));
+  ["ticket svc · compensatable","channel svc · compensatable",
+   "pager svc · IRREVERSIBLE"].forEach(n=>t.appendChild(el("span","node up",n)));
+  t.appendChild(el("span","arrow","→"));
+  t.appendChild(el("span","node","ground-truth ledger"));
+  if(pal.residue && pal.residue.length)
+    t.appendChild(el("span","node down","residue ×"+pal.residue.length));
+}
+
+function renderBoard(data){
+  const b = document.getElementById("board");
+  b.innerHTML="";
+  b.appendChild(el("div","hd","scoreboard"));
+  data.order.forEach(mode=>{
+    const p = data.panes[mode]||{};
+    const cell = el("div","cell");
+    if(p.empty){ cell.appendChild(el("div","gross",mode+": —")); b.appendChild(cell); return; }
+    const s = p.scoreboard;
+    [["tickets",s.tickets],["posts",s.posts],["pages",s.pages]].forEach(([k,v])=>{
+      const n = el("div","num "+(v===0?"n-zero":v===1?"n-one":"n-many"), String(v));
+      n.appendChild(el("small",null,k));
+      cell.appendChild(n);
+    });
+    const g = s.gross;
+    cell.appendChild(el("div","gross","gross "+(g.create_ticket||0)+"/"+
+      (g.post_to_channel||0)+"/"+(g.page_oncall||0)+"  ·  "+mode));
+    b.appendChild(cell);
+  });
+}
+
+/* ------------------------------------------------------------- controls ---- */
+let CONTROL_ENABLED = false;
+let LIVE_SCENARIOS = [];
+const note = (t,cls)=>{ const n=document.getElementById("ctlnote");
+  n.textContent=t; n.className="ctl-note"+(cls?" "+cls:""); };
+
+async function initControls(){
+  const sel = document.getElementById("scenario");
+  const btn = document.getElementById("runbtn");
+  let names = SCENARIOS.map(s=>s.name);
+  try{
+    const h = await (await fetch("/api/health",{cache:"no-store"})).json();
+    CONTROL_ENABLED = !!h.control_enabled;
+    if(h.scenarios && h.scenarios.length) names = h.scenarios;
+    if(h.live_scenarios) LIVE_SCENARIOS = h.live_scenarios;
+  }catch(e){ /* health is a nicety; the dropdown still populates from the page */ }
+
+  const blurb = {};
+  SCENARIOS.forEach(s=>blurb[s.name]=s.tag);
+  names.forEach(n=>{
+    const o=document.createElement("option");
+    o.value=n; o.textContent = n + (blurb[n]?"  —  "+blurb[n]:"");
+    sel.appendChild(o);
+  });
+
+  const live = document.getElementById("runlive");
+  if(!CONTROL_ENABLED){
+    btn.disabled = true; live.disabled = true;
+    note("read-only — restart with:  sluice dashboard --allow-control","warn");
+    return;
+  }
+
+  /* Only some scenarios survive the trip over the real distributed path. The rest
+     need engine parameters the orchestrator process does not expose, so the button says
+     so instead of quietly running poison and looking broken. */
+  function syncLiveButton(){
+    const ok = LIVE_SCENARIOS.length===0 || LIVE_SCENARIOS.includes(sel.value);
+    live.disabled = !ok;
+    live.title = ok
+      ? "producer → Redis → orchestrator → HTTP services"
+      : sel.value+" needs engine parameters the orchestrator CLI does not expose"
+        +" — distributed run supports: "+LIVE_SCENARIOS.join(", ");
+    if(!ok) note(sel.value+" runs in the three panes only — distributed supports "
+                 +LIVE_SCENARIOS.join(", "),"warn");
+    else note("Run drives the 3 panes · Run distributed drives the live one");
+  }
+  sel.addEventListener("change", syncLiveButton);
+  document.getElementById("livemode").addEventListener("change", syncLiveButton);
+  syncLiveButton();
+  note("Run drives the 3 panes · Run distributed drives the live one");
+  btn.addEventListener("click", async ()=>{
+    const scenario = sel.value, pause = document.getElementById("speed").value;
+    btn.disabled = true; note("launching "+scenario+"…","busy");
+    try{
+      const r = await fetch(`/api/run?scenario=${encodeURIComponent(scenario)}`
+                            + `&step_pause_s=${encodeURIComponent(pause)}`, {method:"POST"});
+      if(!r.ok) throw new Error("HTTP "+r.status);
+      note("running "+scenario+" …","busy");
+    }catch(e){
+      note("could not launch: "+e.message,"warn"); btn.disabled=false;
+    }
+  });
+
+  // The three panes and the live pane are driven by different things. Run touches
+  // only the demo journals; the live pane needs the real orchestrator, which is
+  // why it gets its own button rather than appearing to update on its own.
+  live.addEventListener("click", async ()=>{
+    const scenario = sel.value, m = document.getElementById("livemode").value;
+    live.disabled = true;
+    note("distributed "+scenario+" / "+m+" — needs services + Redis…","busy");
+    try{
+      const r = await fetch(`/api/run_live?scenario=${encodeURIComponent(scenario)}`
+                            + `&mode=${encodeURIComponent(m)}&count=1&fresh=true`,
+                            {method:"POST"});
+      if(!r.ok){
+        const d = await r.json().catch(()=>({}));
+        throw new Error(d.detail || ("HTTP "+r.status));
+      }
+    }catch(e){
+      note(e.message,"warn"); live.disabled=false;
+    }
+  });
+}
+
+/* Re-enable the Run button when the server reports nothing in flight. Polling
+   /api/health is how we know the worker thread finished; the page never guesses. */
+async function pollRunning(){
+  if(!CONTROL_ENABLED) return;
+  try{
+    const h = await (await fetch("/api/health",{cache:"no-store"})).json();
+    const run = h.running||{};
+    const liveBusy = "live" in run;
+    const demoBusy = Object.keys(run).some(k=>k!=="live");
+    const btn = document.getElementById("runbtn"), live = document.getElementById("runlive");
+    btn.disabled = demoBusy; live.disabled = liveBusy;
+    if(liveBusy)      note("distributed run in flight …","busy");
+    else if(demoBusy) note("running "+run[Object.keys(run).find(k=>k!=="live")]+" …","busy");
+    else              note("Run drives the 3 panes · Run distributed drives the live one");
+  }catch(e){}
+}
+
+/* ---------------------------------------------------------------- theme ---- */
+(function(){
+  const root = document.documentElement;
+  let saved = null;
+  try{ saved = localStorage.getItem("sluice-theme"); }catch(e){}
+  if(saved) root.setAttribute("data-theme", saved);
+  document.getElementById("theme").addEventListener("click", ()=>{
+    const next = root.getAttribute("data-theme")==="light" ? "dark" : "light";
+    root.setAttribute("data-theme", next);
+    try{ localStorage.setItem("sluice-theme", next); }catch(e){}
+  });
+})();
+
+async function tick(){
+  try{
+    const r = await fetch("/api/state",{cache:"no-store"});
+    const data = await r.json();
+    const panes = document.getElementById("panes");
+    panes.innerHTML="";
+    data.order.forEach(m=>panes.appendChild(renderPane(m, data.panes[m]||{empty:true,missing:true})));
+
+    // The distributed pane only appears once there is a distributed run to show;
+    // an empty gold box on stage is worse than no box.
+    const wrap = document.getElementById("live-wrap");
+    if(data.live && !data.live.missing && !data.live.empty){
+      wrap.hidden = false;
+      const host = document.getElementById("live-pane");
+      host.innerHTML = "";
+      host.appendChild(renderPane("sluice", data.live, {live:true,
+        title:"live orchestrator",
+        blurb:"sluice orchestrator — real sockets, real stream, real ledger"}));
+    } else {
+      wrap.hidden = true;
+    }
+
+    renderTopo(data); renderBoard(data);
+    document.getElementById("tag").textContent =
+      "reading journals · " + new Date().toLocaleTimeString();
+  }catch(e){
+    document.getElementById("tag").textContent = "dashboard offline — demo from the terminal";
+  }
+}
+renderStatic();
+initControls();
+showTab(TABS.includes(location.hash.slice(1)) ? location.hash.slice(1) : "live");
+tick(); setInterval(tick, 450);
+setInterval(pollRunning, 900);
+</script>
+</body>
+</html>
