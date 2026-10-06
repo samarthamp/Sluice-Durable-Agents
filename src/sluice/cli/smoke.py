@@ -7,7 +7,9 @@ Talks to the services at their configured URLs (``SLUICE_*_URL``, default
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+import tempfile
 import time
 import uuid
 
@@ -25,6 +27,19 @@ def _key(workflow: str) -> str:
     from ..core.types import effect_key
 
     return effect_key(workflow, "br-smoke-" + uuid.uuid4().hex[:6], 4)
+
+
+def _await_ledger_entry(ledger, workflow_id: str, key: str, timeout_s: float) -> bool:
+    """Wait until an effect with ``key`` shows up in the ledger, or give up."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            if any(e["key"] == key for e in ledger.effects(workflow_id=workflow_id)):
+                return True
+        except Exception:
+            pass
+        time.sleep(0.1)
+    return False
 
 
 # ------------------------------------------------------------------ dependencies
@@ -159,9 +174,13 @@ def check_http() -> None:
     # --- a real socket timeout, not a simulated one
     world.set_faults("pager", {"latency_s": 1.5})
     t0 = time.time()
-    slow = world.execute("page_oncall", {"rota": "rota-Y"}, _key(wf), 9, 0.4)
+    slow_key = _key(wf)
+    slow = world.execute("page_oncall", {"rota": "rota-Y"}, slow_key, 9, 0.4)
     elapsed = time.time() - t0
     world.set_faults("pager", {"latency_s": 0.0})
+    # The pager is still working on that request. Let it land before the reset below,
+    # or it reaches the ledger afterwards and is counted against whatever runs next.
+    _await_ledger_entry(ledger, wf, slow_key, timeout_s=3.0)
     if slow.status == "unknown":
         check("real read timeout yields 'unknown'", PASS,
               f"gave up after {elapsed:.2f}s with the request in flight;"
@@ -268,14 +287,17 @@ def check_end_to_end() -> None:
     try:
         from ..scenarios import ALERT, make_ctx, scenario_poison
         from ..verification.checker import check_eeo
+        from ..world.faults import NO_FAULTS
     except ImportError as e:
         check("end-to-end over HTTP", SKIP, str(e))
         return
 
+    workdir = tempfile.TemporaryDirectory(prefix="sluice-smoke-")
     try:
-        ctx = make_ctx(".sluice/smoke.db", world_kind="http")
+        ctx = make_ctx(os.path.join(workdir.name, "smoke.db"), world_kind="http")
     except Exception as e:
         check("end-to-end over HTTP", FAIL, f"could not build an HTTP context: {e}")
+        workdir.cleanup()
         return
 
     try:
@@ -295,7 +317,13 @@ def check_end_to_end() -> None:
     except Exception as e:
         check("poison step end-to-end over HTTP", FAIL, f"{type(e).__name__}: {e}")
     finally:
+        # Clear the poisoned rota, so the next run does not inherit it unknowingly.
+        try:
+            ctx.set_faults(**NO_FAULTS)
+        except Exception:
+            pass
         ctx.close()
+        workdir.cleanup()
 
 
 def main(argv=None, prog: str | None = None) -> int:
