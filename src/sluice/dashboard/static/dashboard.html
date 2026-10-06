@@ -1152,8 +1152,29 @@ function renderBoard(data){
 /* ------------------------------------------------------------- controls ---- */
 let CONTROL_ENABLED = false;
 let LIVE_SCENARIOS = [];
+let LIVE_BUSY = false;
 const note = (t,cls)=>{ const n=document.getElementById("ctlnote");
   n.textContent=t; n.className="ctl-note"+(cls?" "+cls:""); };
+
+/* Only some scenarios survive the trip over the real distributed path. The rest
+   need engine parameters the orchestrator process does not expose, so the button is
+   disabled and says so, instead of quietly running poison and looking broken. */
+function liveAllowed(){
+  const sel = document.getElementById("scenario");
+  return LIVE_SCENARIOS.length===0 || LIVE_SCENARIOS.includes(sel.value);
+}
+function syncLiveButton(){
+  const sel = document.getElementById("scenario"), live = document.getElementById("runlive");
+  const ok = liveAllowed();
+  live.disabled = LIVE_BUSY || !ok;
+  live.title = ok
+    ? "producer → Redis → orchestrator → HTTP services"
+    : sel.value+" needs engine parameters the orchestrator process does not expose"
+      +" — distributed run supports: "+LIVE_SCENARIOS.join(", ");
+  if(!ok) note(sel.value+" runs in the three panes only — distributed supports "
+               +LIVE_SCENARIOS.join(", "),"warn");
+  else note("Run drives the 3 panes · Run distributed drives the live one");
+}
 
 async function initControls(){
   const sel = document.getElementById("scenario");
@@ -1173,6 +1194,8 @@ async function initControls(){
     o.value=n; o.textContent = n + (blurb[n]?"  —  "+blurb[n]:"");
     sel.appendChild(o);
   });
+  // The headline scenario: it runs in the three panes and over the distributed path.
+  if(names.includes("poison")) sel.value = "poison";
 
   const live = document.getElementById("runlive");
   if(!CONTROL_ENABLED){
@@ -1181,24 +1204,9 @@ async function initControls(){
     return;
   }
 
-  /* Only some scenarios survive the trip over the real distributed path. The rest
-     need engine parameters the orchestrator process does not expose, so the button says
-     so instead of quietly running poison and looking broken. */
-  function syncLiveButton(){
-    const ok = LIVE_SCENARIOS.length===0 || LIVE_SCENARIOS.includes(sel.value);
-    live.disabled = !ok;
-    live.title = ok
-      ? "producer → Redis → orchestrator → HTTP services"
-      : sel.value+" needs engine parameters the orchestrator CLI does not expose"
-        +" — distributed run supports: "+LIVE_SCENARIOS.join(", ");
-    if(!ok) note(sel.value+" runs in the three panes only — distributed supports "
-                 +LIVE_SCENARIOS.join(", "),"warn");
-    else note("Run drives the 3 panes · Run distributed drives the live one");
-  }
   sel.addEventListener("change", syncLiveButton);
   document.getElementById("livemode").addEventListener("change", syncLiveButton);
   syncLiveButton();
-  note("Run drives the 3 panes · Run distributed drives the live one");
   btn.addEventListener("click", async ()=>{
     const scenario = sel.value, pause = document.getElementById("speed").value;
     btn.disabled = true; note("launching "+scenario+"…","busy");
@@ -1228,7 +1236,7 @@ async function initControls(){
         throw new Error(d.detail || ("HTTP "+r.status));
       }
     }catch(e){
-      note(e.message,"warn"); live.disabled=false;
+      note(e.message,"warn"); live.disabled = !liveAllowed();
     }
   });
 }
@@ -1243,10 +1251,11 @@ async function pollRunning(){
     const liveBusy = "live" in run;
     const demoBusy = Object.keys(run).some(k=>k!=="live");
     const btn = document.getElementById("runbtn"), live = document.getElementById("runlive");
-    btn.disabled = demoBusy; live.disabled = liveBusy;
+    LIVE_BUSY = liveBusy;
+    btn.disabled = demoBusy; live.disabled = liveBusy || !liveAllowed();
     if(liveBusy)      note("distributed run in flight …","busy");
     else if(demoBusy) note("running "+run[Object.keys(run).find(k=>k!=="live")]+" …","busy");
-    else              note("Run drives the 3 panes · Run distributed drives the live one");
+    else              syncLiveButton();
   }catch(e){}
 }
 
