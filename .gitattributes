@@ -1,0 +1,9 @@
+# Normalise text files to LF in the repository.
+* text=auto
+
+# Shell scripts must stay LF even in a Windows checkout: run from WSL, a CRLF script
+# fails with "$'\r': command not found".
+*.sh  text eol=lf
+
+# cmd.exe mis-parses labels and goto in LF-only batch files.
+*.bat text eol=crlf

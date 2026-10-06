@@ -3,15 +3,38 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
+.ruff_cache/
+
+# packaging (pip install -e . / pip wheel)
+*.egg-info/
+build/
+dist/
 
 # journals and demo output
-.palimpsest/
+.sluice/
 .runs/
 *.db
 *.db-wal
 *.db-shm
 audit/
 
-# verify.bat output
+# verify script output
 _verify_out/
 *.verdict.json
+
+# personal notes, kept out of the repository
+tracker.md
+*master-plan*.md
+
+# editors, OS files, local environment, logs, coverage
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+.env
+.env.*
+*.log
+nohup.out
+.coverage
+htmlcov/
